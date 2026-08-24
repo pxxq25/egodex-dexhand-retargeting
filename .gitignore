@@ -1,0 +1,39 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Large or licensed third-party components are installed separately.
+third_party/
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Input data and generated media.
+datasets/
+data/
+runs/
+artifacts/
+outputs/
+*.h5
+*.hdf5
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.npz
+
+# Pipeline scratch directories.
+frames/
+render/
+human_mask*/
+inpaint*/
+derived/

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egodex-dexhand"
+version = "0.1.0"
+description = "No-training EgoDex to dexterous robot embodiment video retargeting prototype"
+requires-python = ">=3.10"
+dependencies = [
+  "h5py>=3.8",
+  "numpy>=2",
+  "opencv-python>=4.8",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+egoquest = [
+  "mediapipe>=0.10",
+  "pyarrow>=12",
+]
+test = [
+  "pytest>=7",
+]
+
+[project.scripts]
+egodex-dexhand = "egodex_dexhand.cli:main"
+egodex-ur5e-shadow = "egodex_dexhand.ur5e_shadow_cli:main"
+egodex-bimanual-shadow = "egodex_dexhand.bimanual_cli:main"
+egodex-whole-arm = "egodex_dexhand.whole_arm_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
