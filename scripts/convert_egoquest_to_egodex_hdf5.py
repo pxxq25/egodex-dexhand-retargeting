@@ -92,8 +92,12 @@ def main() -> None:
 
     calibration = session["camera_calibration"]
     source_width, source_height = calibration["current_resolution"]
-    video_width = int(session["video_resolution"]["width"])
-    video_height = int(session["video_resolution"]["height"])
+    video_resolution = session.get("video_resolution")
+    if video_resolution is None:
+        video_width, video_height = int(source_width), int(source_height)
+    else:
+        video_width = int(video_resolution["width"])
+        video_height = int(video_resolution["height"])
     scale_x, scale_y = video_width / source_width, video_height / source_height
     fx, fy = calibration["focal_length"]
     cx, cy = calibration["principal_point"]

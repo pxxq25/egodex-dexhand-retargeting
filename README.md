@@ -137,6 +137,28 @@ For difficult lighting or projection mismatch, the repository also includes:
 Pass the image-aligned result to `egodex-bimanual-shadow --mask-hdf5 ...` so
 masking can be corrected without changing robot motion.
 
+### Adaptive whole-recording processing
+
+Use the adaptive runner when a recording alternates between left-hand,
+right-hand, and bimanual activity:
+
+```bash
+python scripts/run_egoquest_adaptive_recording.py \
+  --recording /path/to/egoquest/recording \
+  --workspace /path/to/runtime \
+  --run-name adaptive_run
+```
+
+The default visibility policy starts removal eight frames before a projected
+hand first becomes reliable and keeps it active for four frames after the last
+detection. A single valid projected landmark is enough to open an interval,
+and intervals as short as six frames are retained. These defaults prevent the
+human hand or sleeve from appearing briefly before inpainting begins. The
+runner also retains the Shadow Hand's distal `forearm` mesh while hiding the
+proximal UR5e links. Override the policy with
+`--minimum-visible-landmarks`, `--entry-padding-frames`,
+`--exit-padding-frames`, and `--min-frames` when needed.
+
 ## Tests
 
 ```bash
