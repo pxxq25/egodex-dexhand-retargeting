@@ -7,8 +7,10 @@ import numpy as np
 from egodex_dexhand.compose import (
     _composite_premultiplied,
     _fallback_premultiplied_matte,
+    _frame_visibility_selector,
     _filter_premultiplied,
 )
+from egodex_dexhand.data import fuse_hand_visibility, projected_hand_visibility
 from egodex_dexhand.render import (
     DEFAULT_TEMPORAL_SAMPLES,
     _decontaminate_foreground,
@@ -173,6 +175,97 @@ class HaloFreeCompositeTests(unittest.TestCase):
         transition = composite[edge]
         self.assertTrue(np.all(transition[:, 0] == 0))
         self.assertTrue(np.all(transition[:, 2] == 0))
+
+
+class FrameVisibilityGateTests(unittest.TestCase):
+    def test_direct_rgb_detection_recovers_projection_edge_case(self) -> None:
+        projected = np.asarray([True, False, False])
+        confidence = np.asarray(
+            [[0.0, 0.0], [1.0, 1.0], [0.55, 0.55]], dtype=np.float32
+        )
+
+        fused = fuse_hand_visibility(projected, confidence)
+
+        np.testing.assert_array_equal(fused, [True, True, False])
+
+    def test_projection_marks_only_landmarks_inside_camera_frustum(self) -> None:
+        intrinsic = np.asarray(
+            [[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        joints = np.asarray(
+            [
+                [[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]],
+                [[2.0, 0.0, 1.0], [2.0, 0.0, 1.0]],
+                [[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]],
+            ],
+            dtype=np.float32,
+        )
+
+        visible = projected_hand_visibility(
+            joints,
+            intrinsic,
+            100,
+            80,
+            minimum_visible_landmarks=1,
+            image_margin=0,
+        )
+
+        np.testing.assert_array_equal(visible, [True, False, False])
+
+    def test_robot_is_suppressed_when_human_is_not_projected(self) -> None:
+        union = np.ones((3, 4), dtype=bool)
+        rendered = np.full((3, 4), 255, dtype=np.uint8)
+
+        permitted, use_inpainted, decisions = _frame_visibility_selector(
+            0,
+            union,
+            {"right": np.asarray([False])},
+            {"right": [rendered]},
+            minimum_robot_pixels=4,
+        )
+
+        self.assertFalse(permitted.any())
+        self.assertFalse(use_inpainted)
+        self.assertEqual(decisions, {"right": (False, True)})
+
+    def test_human_without_robot_uses_inpaint_but_has_no_robot_pixels(self) -> None:
+        union = np.ones((3, 4), dtype=bool)
+        tiny_render = np.zeros((3, 4), dtype=np.uint8)
+        tiny_render[0, 0] = 255
+
+        permitted, use_inpainted, decisions = _frame_visibility_selector(
+            0,
+            union,
+            {"left": np.asarray([True])},
+            {"left": [tiny_render]},
+            minimum_robot_pixels=4,
+        )
+
+        self.assertFalse(permitted.any())
+        self.assertTrue(use_inpainted)
+        self.assertEqual(decisions, {"left": (True, False)})
+
+    def test_bimanual_gate_keeps_only_visible_side(self) -> None:
+        union = np.ones((2, 4), dtype=bool)
+        left = np.zeros((2, 4), dtype=np.uint8)
+        right = np.zeros((2, 4), dtype=np.uint8)
+        left[:, :2] = 255
+        right[:, 2:] = 255
+
+        permitted, use_inpainted, _ = _frame_visibility_selector(
+            0,
+            union,
+            {"left": np.asarray([True]), "right": np.asarray([False])},
+            {"left": [left], "right": [right]},
+            minimum_robot_pixels=2,
+        )
+
+        np.testing.assert_array_equal(
+            permitted,
+            [[True, True, False, False], [True, True, False, False]],
+        )
+        self.assertTrue(use_inpainted)
 
 
 if __name__ == "__main__":

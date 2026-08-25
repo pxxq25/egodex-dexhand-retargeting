@@ -196,6 +196,69 @@ def project_camera_points(points_cv: np.ndarray, intrinsic: np.ndarray) -> np.nd
     return pixels
 
 
+def projected_hand_visibility(
+    joints_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    joint_confidence: np.ndarray | None = None,
+    minimum_visible_landmarks: int = 1,
+    image_margin: float = 20.0,
+    minimum_depth: float = 0.05,
+) -> np.ndarray:
+    """Return frame-level hand visibility from camera-space 3-D landmarks.
+
+    This signal is deliberately unpadded.  Temporal padding belongs to the
+    segmentation/inpainting work window; final robot compositing must follow
+    the frames in which the source hand actually projects into the camera.
+    """
+
+    joints = np.asarray(joints_camera_cv, dtype=np.float32)
+    if joints.ndim != 3 or joints.shape[-1] != 3:
+        raise ValueError("hand joints must have shape [frames, landmarks, 3]")
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+    if not 1 <= minimum_visible_landmarks <= joints.shape[1]:
+        raise ValueError(
+            "minimum_visible_landmarks must be within the landmark count"
+        )
+    pixels = project_camera_points(joints, intrinsic)
+    valid = np.isfinite(joints).all(axis=-1) & (joints[..., 2] > minimum_depth)
+    valid &= (
+        (pixels[..., 0] >= -image_margin)
+        & (pixels[..., 0] < width + image_margin)
+        & (pixels[..., 1] >= -image_margin)
+        & (pixels[..., 1] < height + image_margin)
+    )
+    if joint_confidence is not None:
+        confidence = np.asarray(joint_confidence, dtype=np.float32)
+        if confidence.shape != valid.shape:
+            raise ValueError("joint confidence shape does not match hand joints")
+        valid &= confidence > 0.0
+    return valid.sum(axis=1) >= minimum_visible_landmarks
+
+
+def fuse_hand_visibility(
+    projected_visibility: np.ndarray,
+    rgb_joint_confidence: np.ndarray | None = None,
+    *,
+    direct_detection_threshold: float = 0.9,
+) -> np.ndarray:
+    """Fuse world projection with non-interpolated RGB hand detections."""
+
+    projected = np.asarray(projected_visibility, dtype=bool)
+    if projected.ndim != 1:
+        raise ValueError("projected visibility must be one-dimensional")
+    if rgb_joint_confidence is None:
+        return projected.copy()
+    confidence = np.asarray(rgb_joint_confidence, dtype=np.float32)
+    if confidence.ndim != 2 or confidence.shape[0] != len(projected):
+        raise ValueError("RGB confidence must have shape [frames, landmarks]")
+    direct_rgb = np.any(confidence >= direct_detection_threshold, axis=1)
+    return projected | direct_rgb
+
+
 def scaled_intrinsic(
     intrinsic: np.ndarray, scale_x: float, scale_y: float | None = None
 ) -> np.ndarray:

@@ -15,6 +15,20 @@ SPEC.loader.exec_module(adaptive_recording)
 
 
 class AdaptiveVisibilityTests(unittest.TestCase):
+    def test_balanced_split_avoids_two_frame_tail(self) -> None:
+        ranges = adaptive_recording.balanced_chunk_ranges(
+            1057, 1299, min_frames=6, max_frames=240
+        )
+
+        self.assertEqual(ranges, [(1057, 1178), (1178, 1299)])
+        self.assertTrue(all(6 <= end - start <= 240 for start, end in ranges))
+
+    def test_balanced_split_rejects_inverted_chunk_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            adaptive_recording.balanced_chunk_ranges(
+                0, 20, min_frames=10, max_frames=5
+            )
+
     def test_entry_and_exit_padding_expand_interval_symmetrically_in_time(self) -> None:
         visible = np.zeros(12, dtype=bool)
         visible[5:7] = True

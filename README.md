@@ -149,15 +149,22 @@ python scripts/run_egoquest_adaptive_recording.py \
   --run-name adaptive_run
 ```
 
-The default visibility policy starts removal eight frames before a projected
-hand first becomes reliable and keeps it active for four frames after the last
-detection. A single valid projected landmark is enough to open an interval,
-and intervals as short as six frames are retained. These defaults prevent the
-human hand or sleeve from appearing briefly before inpainting begins. The
-runner also retains the Shadow Hand's distal `forearm` mesh while hiding the
-proximal UR5e links. Override the policy with
+The default processing policy reserves eight frames before and after a
+projected hand interval for segmentation and inpainting. Final compositing is
+controlled separately, frame by frame: unaligned world-coordinate landmarks
+are projected into the camera, direct RGB landmark detections recover
+calibration-edge cases, and each side must also contain at least 16 rendered
+robot-mask pixels. Padded frames therefore help SAM2 and ProPainter without
+making a robot appear early. A single valid projected landmark is enough to
+open an interval, and intervals as short as six frames are retained. Long
+intervals are split into balanced chunks so they cannot leave an undersized
+tail. The runner also retains the Shadow Hand's distal `forearm` mesh while
+hiding the proximal UR5e links. Override the processing reserve with
 `--minimum-visible-landmarks`, `--entry-padding-frames`,
 `--exit-padding-frames`, and `--min-frames` when needed.
+
+Every segment writes `final/visibility_gate.json`, including human-visible,
+robot-visible, composited, and mismatch frame indices for each side.
 
 ## Tests
 

@@ -13,8 +13,10 @@ import numpy as np
 from .compose import composite_videos
 from .data import (
     extract_video_frames,
+    fuse_hand_visibility,
     load_egodex_arm_sequence,
     load_egodex_sequence,
+    projected_hand_visibility,
     scaled_intrinsic,
 )
 from .inpaint import run_propainter
@@ -44,6 +46,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video", required=True, type=Path)
     parser.add_argument("--hdf5", required=True, type=Path)
+    parser.add_argument(
+        "--visibility-hdf5",
+        type=Path,
+        help=(
+            "optional unaligned world-coordinate trajectory used only for "
+            "frame-level camera-frustum visibility gating"
+        ),
+    )
     parser.add_argument(
         "--mask-hdf5",
         type=Path,
@@ -101,6 +111,7 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "recurrent_flow_completion.pth",
     )
     mask_hdf5 = (args.mask_hdf5 or args.hdf5).resolve()
+    visibility_hdf5 = (args.visibility_hdf5 or args.hdf5).resolve()
     return {
         "video": str(args.video.resolve()),
         "video_sha256": _sha256(args.video.resolve()),
@@ -108,6 +119,8 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "hdf5_sha256": _sha256(args.hdf5.resolve()),
         "mask_hdf5": str(mask_hdf5),
         "mask_hdf5_sha256": _sha256(mask_hdf5),
+        "visibility_hdf5": str(visibility_hdf5),
+        "visibility_hdf5_sha256": _sha256(visibility_hdf5),
         "robot": "shadow",
         "arm": "ur5e",
         "embodiment": f"ur5e+shadow_{args.hand}",
@@ -187,6 +200,9 @@ def main() -> None:
     mask_hdf5 = args.mask_hdf5 or args.hdf5
     mask_hand_sequence = load_egodex_sequence(mask_hdf5, hand=args.hand)
     mask_arm_sequence = load_egodex_arm_sequence(mask_hdf5, hand=args.hand)
+    visibility_sequence = load_egodex_sequence(
+        args.visibility_hdf5 or args.hdf5, hand=args.hand
+    )
     other_hand = "left" if args.hand == "right" else "right"
     negative_sequence = load_egodex_sequence(args.hdf5, hand=other_hand)
     provenance = _provenance(args)
@@ -201,6 +217,7 @@ def main() -> None:
             or count != arm_sequence.frame_count
             or count != mask_hand_sequence.frame_count
             or count != mask_arm_sequence.frame_count
+            or count != visibility_sequence.frame_count
         ):
             raise ValueError("video, hand, and arm frame counts do not match")
         metadata_file.write_text(
@@ -369,6 +386,27 @@ def main() -> None:
             robot_mask_dir=render_dir / "robot_mask",
             human_mask_dir=human_masks,
             output_dir=output / "final",
+            human_visibility_by_side={
+                args.hand: fuse_hand_visibility(
+                    projected_hand_visibility(
+                        visibility_sequence.joints_camera_cv,
+                        scaled_intrinsic(
+                            visibility_sequence.intrinsic,
+                            width / int(metadata["source_width"]),
+                            height / int(metadata["source_height"]),
+                        ),
+                        width,
+                        height,
+                        joint_confidence=visibility_sequence.joint_confidence,
+                    ),
+                    (
+                        mask_hand_sequence.joint_confidence
+                        if args.mask_hdf5 is not None
+                        else None
+                    ),
+                )
+            },
+            robot_mask_dirs_by_side={args.hand: render_dir / "robot_mask"},
         )
     print(f"complete: {output}")
 

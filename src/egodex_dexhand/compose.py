@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import cv2
@@ -93,6 +94,31 @@ def _discover_render_mattes(
     return premultiplied, alphas
 
 
+def _frame_visibility_selector(
+    index: int,
+    robot_union_mask: np.ndarray,
+    human_visibility_by_side: dict[str, np.ndarray],
+    side_robot_masks: dict[str, list[np.ndarray]],
+    minimum_robot_pixels: int,
+) -> tuple[np.ndarray, bool, dict[str, tuple[bool, bool]]]:
+    """Select only robot sides backed by human and rendered visibility."""
+
+    permitted = np.zeros_like(robot_union_mask, dtype=bool)
+    use_inpainted_background = False
+    decisions: dict[str, tuple[bool, bool]] = {}
+    for side, visibility in human_visibility_by_side.items():
+        human_visible = bool(visibility[index])
+        rendered = side_robot_masks[side][index] > 127
+        robot_visible = int(np.count_nonzero(rendered)) >= minimum_robot_pixels
+        decisions[side] = (human_visible, robot_visible)
+        if human_visible:
+            use_inpainted_background = True
+        if human_visible and robot_visible:
+            permitted |= rendered
+    permitted &= np.asarray(robot_union_mask, dtype=bool)
+    return permitted, use_inpainted_background, decisions
+
+
 def composite_videos(
     source_video: str | Path,
     inpainted_video: str | Path,
@@ -102,6 +128,9 @@ def composite_videos(
     output_dir: str | Path,
     human_mask_dilation: int = 18,
     feather_sigma: float = 1.5,
+    human_visibility_by_side: dict[str, np.ndarray] | None = None,
+    robot_mask_dirs_by_side: dict[str, str | Path] | None = None,
+    robot_visibility_min_pixels: int = 16,
 ) -> None:
     """Write halo-free full/conservative composites and a full-mask QA video."""
 
@@ -116,6 +145,27 @@ def composite_videos(
     frame_count = len(robot_rgbs)
     if not (len(robot_masks) == len(human_masks) == frame_count):
         raise ValueError("robot RGB/mask and human-mask frame counts differ")
+
+    side_robot_masks: dict[str, list[np.ndarray]] = {}
+    if (human_visibility_by_side is None) != (robot_mask_dirs_by_side is None):
+        raise ValueError(
+            "human visibility and side robot-mask directories must be provided together"
+        )
+    if human_visibility_by_side is not None:
+        if set(human_visibility_by_side) != set(robot_mask_dirs_by_side or {}):
+            raise ValueError("human visibility and robot-mask sides differ")
+        for side, visibility in human_visibility_by_side.items():
+            values = np.asarray(visibility, dtype=bool)
+            if values.shape != (frame_count,):
+                raise ValueError(f"{side} visibility length differs from render")
+            human_visibility_by_side[side] = values
+            side_robot_masks[side] = read_numbered_images(
+                (robot_mask_dirs_by_side or {})[side], grayscale=True
+            )
+            if len(side_robot_masks[side]) != frame_count:
+                raise ValueError(f"{side} robot-mask frame count differs")
+    if robot_visibility_min_pixels < 1:
+        raise ValueError("robot_visibility_min_pixels must be positive")
 
     render_mattes = _discover_render_mattes(robot_rgb_dir, frame_count)
     source, source_fps, source_size = _open_video(source_video)
@@ -145,6 +195,22 @@ def composite_videos(
     kernel_size = max(1, int(human_mask_dilation) * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     processed = 0
+    gate_summary: dict[str, object] = {
+        "enabled": human_visibility_by_side is not None,
+        "robot_visibility_min_pixels": robot_visibility_min_pixels,
+        "sides": {},
+    }
+    if human_visibility_by_side is not None:
+        gate_summary["sides"] = {
+            side: {
+                "human_visible_frames": int(np.count_nonzero(visibility)),
+                "robot_visible_frames": 0,
+                "composited_frames": 0,
+                "human_without_robot_frames": [],
+                "robot_without_human_frames": [],
+            }
+            for side, visibility in human_visibility_by_side.items()
+        }
     for index in range(frame_count):
         ok_source, source_frame = source.read()
         ok_inpaint, background = inpainted.read()
@@ -169,6 +235,34 @@ def composite_videos(
             alpha_raw *= robot_mask.astype(np.float32)
             premultiplied_raw *= robot_mask[..., None]
 
+        use_inpainted_background = True
+        if human_visibility_by_side is not None:
+            permitted_robot, use_inpainted_background, decisions = (
+                _frame_visibility_selector(
+                    index,
+                    robot_mask,
+                    human_visibility_by_side,
+                    side_robot_masks,
+                    robot_visibility_min_pixels,
+                )
+            )
+            side_summary = gate_summary["sides"]
+            assert isinstance(side_summary, dict)
+            for side, (human_visible, robot_visible) in decisions.items():
+                stats = side_summary[side]
+                if robot_visible:
+                    stats["robot_visible_frames"] += 1
+                if human_visible and robot_visible:
+                    stats["composited_frames"] += 1
+                elif human_visible:
+                    stats["human_without_robot_frames"].append(index)
+                elif robot_visible:
+                    stats["robot_without_human_frames"].append(index)
+            alpha_raw *= permitted_robot.astype(np.float32)
+            premultiplied_raw *= permitted_robot[..., None]
+
+        composite_background = background if use_inpainted_background else source_frame
+
         expanded_human = cv2.dilate(human_mask.astype(np.uint8), kernel) > 0
         full_premultiplied, full_alpha = _filter_premultiplied(
             premultiplied_raw, alpha_raw, feather_sigma
@@ -181,10 +275,10 @@ def composite_videos(
         )
 
         full = _composite_premultiplied(
-            background, full_premultiplied, full_alpha
+            composite_background, full_premultiplied, full_alpha
         )
         conservative = _composite_premultiplied(
-            background, conservative_premultiplied, conservative_alpha
+            composite_background, conservative_premultiplied, conservative_alpha
         )
         mask_preview = source_frame.copy()
         red = np.zeros_like(mask_preview)
@@ -208,3 +302,6 @@ def composite_videos(
         writer.release()
     if processed != frame_count:
         raise RuntimeError(f"composited {processed} of {frame_count} frames")
+    (output_dir / "visibility_gate.json").write_text(
+        json.dumps(gate_summary, indent=2) + "\n"
+    )

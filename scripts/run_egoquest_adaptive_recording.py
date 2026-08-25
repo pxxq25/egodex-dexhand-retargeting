@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -16,6 +17,29 @@ from scipy.spatial.transform import Rotation
 
 
 STATE_NAMES = {0: "none", 1: "left", 2: "right", 3: "both"}
+
+
+def balanced_chunk_ranges(
+    start: int, end: int, *, min_frames: int, max_frames: int
+) -> list[tuple[int, int]]:
+    """Split an interval without producing a tiny final remainder."""
+
+    if min_frames < 1 or max_frames < min_frames:
+        raise ValueError("chunk limits must satisfy 1 <= min_frames <= max_frames")
+    length = end - start
+    if length < min_frames:
+        return []
+    part_count = max(1, math.ceil(length / max_frames))
+    base, remainder = divmod(length, part_count)
+    if base < min_frames:
+        raise ValueError("interval cannot be partitioned within chunk limits")
+    result = []
+    cursor = start
+    for index in range(part_count):
+        size = base + (1 if index < remainder else 0)
+        result.append((cursor, cursor + size))
+        cursor += size
+    return result
 
 
 def expand_visibility_intervals(
@@ -59,7 +83,7 @@ def hand_visibility(
     *,
     minimum_visible_landmarks: int = 1,
     entry_padding_frames: int = 8,
-    exit_padding_frames: int = 4,
+    exit_padding_frames: int = 8,
 ) -> np.ndarray:
     table = pq.read_table(
         recording / "aligned_frames.parquet",
@@ -144,7 +168,7 @@ def adaptive_chunks(
     end_frame: int | None = None,
     minimum_visible_landmarks: int = 1,
     entry_padding_frames: int = 8,
-    exit_padding_frames: int = 4,
+    exit_padding_frames: int = 8,
 ) -> list[tuple[str, int, int]]:
     visibility_options = {
         "minimum_visible_landmarks": minimum_visible_landmarks,
@@ -165,12 +189,17 @@ def adaptive_chunks(
         state_name = STATE_NAMES[int(state[start])]
         if state_name == "none" or end - start < min_frames:
             continue
-        cursor = int(start) + start_frame
+        absolute_start = int(start) + start_frame
         absolute_end = int(end) + start_frame
-        while cursor < absolute_end:
-            next_end = min(cursor + max_frames, absolute_end)
-            chunks.append((state_name, cursor, next_end))
-            cursor = next_end
+        chunks.extend(
+            (state_name, chunk_start, chunk_end)
+            for chunk_start, chunk_end in balanced_chunk_ranges(
+                absolute_start,
+                absolute_end,
+                min_frames=min_frames,
+                max_frames=max_frames,
+            )
+        )
     return chunks
 
 
@@ -371,7 +400,10 @@ def process_chunk(
         if mode == "both"
         else single_cli(mode, python, workspace, video, aligned_hdf5, output)
     )
-    base.extend(["--mask-hdf5", str(mask_hdf5)])
+    base.extend([
+        "--mask-hdf5", str(mask_hdf5),
+        "--visibility-hdf5", str(hdf5),
+    ])
     run_with_branches(mode, base, environment)
     return final
 
@@ -436,7 +468,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=240)
     parser.add_argument("--minimum-visible-landmarks", type=int, default=1)
     parser.add_argument("--entry-padding-frames", type=int, default=8)
-    parser.add_argument("--exit-padding-frames", type=int, default=4)
+    parser.add_argument("--exit-padding-frames", type=int, default=8)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int)
     parser.add_argument("--detection-brightness-gain", type=float, default=1.0)

@@ -13,8 +13,10 @@ import numpy as np
 from .compose import composite_videos
 from .data import (
     extract_video_frames,
+    fuse_hand_visibility,
     load_egodex_arm_sequence,
     load_egodex_sequence,
+    projected_hand_visibility,
     scaled_intrinsic,
 )
 from .inpaint import run_propainter
@@ -54,6 +56,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video", required=True, type=Path)
     parser.add_argument("--hdf5", required=True, type=Path)
+    parser.add_argument(
+        "--visibility-hdf5",
+        type=Path,
+        help=(
+            "optional unaligned world-coordinate trajectory used only for "
+            "frame-level camera-frustum visibility gating"
+        ),
+    )
     parser.add_argument(
         "--mask-hdf5",
         type=Path,
@@ -144,6 +154,7 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "recurrent_flow_completion.pth",
     )
     mask_hdf5 = (args.mask_hdf5 or args.hdf5).resolve()
+    visibility_hdf5 = (args.visibility_hdf5 or args.hdf5).resolve()
     return {
         "video": str(args.video.resolve()),
         "video_sha256": _sha256(args.video.resolve()),
@@ -151,6 +162,8 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "hdf5_sha256": _sha256(args.hdf5.resolve()),
         "mask_hdf5": str(mask_hdf5),
         "mask_hdf5_sha256": _sha256(mask_hdf5),
+        "visibility_hdf5": str(visibility_hdf5),
+        "visibility_hdf5_sha256": _sha256(visibility_hdf5),
         "robot": "shadow",
         "arm": "ur5e",
         "embodiment": "dual_ur5e+shadow",
@@ -256,6 +269,10 @@ def main() -> None:
     mask_arm_sequences = {
         side: load_egodex_arm_sequence(mask_hdf5, hand=side) for side in SIDES
     }
+    visibility_sequences = {
+        side: load_egodex_sequence(args.visibility_hdf5 or args.hdf5, hand=side)
+        for side in SIDES
+    }
     provenance = _provenance(args)
 
     if _enabled("prepare", args):
@@ -269,6 +286,7 @@ def main() -> None:
                 or count != arm_sequences[side].frame_count
                 or count != mask_hand_sequences[side].frame_count
                 or count != mask_arm_sequences[side].frame_count
+                or count != visibility_sequences[side].frame_count
             ):
                 raise ValueError(f"video and {side} annotation frame counts do not match")
         metadata_file.write_text(
@@ -458,6 +476,32 @@ def main() -> None:
             robot_mask_dir=render_dir / "robot_mask",
             human_mask_dir=union_masks,
             output_dir=output / "final",
+            human_visibility_by_side={
+                side: fuse_hand_visibility(
+                    projected_hand_visibility(
+                        visibility_sequences[side].joints_camera_cv,
+                        scaled_intrinsic(
+                            visibility_sequences[side].intrinsic,
+                            width / int(metadata["source_width"]),
+                            height / int(metadata["source_height"]),
+                        ),
+                        width,
+                        height,
+                        joint_confidence=visibility_sequences[
+                            side
+                        ].joint_confidence,
+                    ),
+                    (
+                        mask_hand_sequences[side].joint_confidence
+                        if args.mask_hdf5 is not None
+                        else None
+                    ),
+                )
+                for side in SIDES
+            },
+            robot_mask_dirs_by_side={
+                side: render_dir / f"{side}_robot_mask" for side in SIDES
+            },
         )
     print(f"complete: {output}")
 

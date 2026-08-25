@@ -14,6 +14,7 @@ from .data import (
     extract_video_frames,
     load_egodex_arm_sequence,
     load_egodex_sequence,
+    projected_hand_visibility,
     scaled_intrinsic,
 )
 from .inpaint import run_propainter
@@ -286,6 +287,16 @@ def main() -> None:
             robot_mask_dir=render_dir / "robot_mask",
             human_mask_dir=human_masks,
             output_dir=output / "final",
+            human_visibility_by_side={
+                args.hand: projected_hand_visibility(
+                    hand_sequence.joints_camera_cv,
+                    intrinsic,
+                    width,
+                    height,
+                    joint_confidence=hand_sequence.joint_confidence,
+                )
+            },
+            robot_mask_dirs_by_side={args.hand: render_dir / "robot_mask"},
         )
     print(f"complete: {output}")
 
