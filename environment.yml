@@ -1,0 +1,12 @@
+name: egodex-dexhand
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.12
+  - pip=25.2
+  - ffmpeg=4.4.2
+  - git=2.51.0
+  - curl=8.14.1
+  - pip:
+      - -r requirements/pytorch-cu126.lock.txt
+      - -r requirements/runtime-cu126.lock.txt

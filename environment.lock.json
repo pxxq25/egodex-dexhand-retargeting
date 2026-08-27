@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "validated_platform": {
+    "distribution": "Ubuntu 22.04",
+    "architecture": "x86_64",
+    "python": "3.10.12",
+    "pytorch": "2.7.1+cu126",
+    "torchvision": "0.22.1+cu126",
+    "cuda_runtime": "12.6",
+    "cudnn": "9.5.1",
+    "minimum_nvidia_driver": "560.35.03",
+    "validated_nvidia_driver": "580.95.05",
+    "vulkan_api": "1.3+"
+  },
+  "container_base": {
+    "image": "nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04",
+    "digest": "sha256:5f0d2d827f6436b3cb7468fd8acbdc8c1d41261614e579ae49afe6141da51133"
+  },
+  "build_tools": {
+    "pip": "25.2",
+    "setuptools": "80.9.0",
+    "wheel": "0.45.1"
+  },
+  "critical_imports": {
+    "torch": "2.7.1+cu126",
+    "torchvision": "0.22.1+cu126",
+    "numpy": "2.2.6",
+    "cv2": "4.13.0",
+    "scipy": "1.15.3",
+    "h5py": "3.16.0",
+    "pyarrow": "25.0.1",
+    "sapien": "3.0.3",
+    "pinocchio": "4.1.0",
+    "dex_retargeting": "0.5.0"
+  },
+  "mediapipe_sidecar": {
+    "python": "3.10",
+    "mediapipe": "0.10.21",
+    "numpy": "1.26.4",
+    "opencv": "4.11.0"
+  },
+  "pytorch_cuda_lock": "requirements/pytorch-cu126.lock.txt",
+  "python_lock": "requirements/runtime-cu126.lock.txt",
+  "mediapipe_lock": "requirements/mediapipe.lock.txt",
+  "third_party_lock": "third_party.lock.json"
+}

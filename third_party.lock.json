@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "name": "dex-retargeting",
+      "url": "https://github.com/dexsuite/dex-retargeting.git",
+      "commit": "3f56141bc8bd2760d5e452e382937269554ebb21",
+      "recursive": true,
+      "submodules": [
+        {
+          "path": "assets",
+          "commit": "7304c7fb59214dab870eca02cf26f76e944e12df"
+        }
+      ],
+      "editable_install": true,
+      "license": "MIT; nested robot assets have separate licenses"
+    },
+    {
+      "name": "sam2",
+      "url": "https://github.com/facebookresearch/sam2.git",
+      "commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+      "recursive": false,
+      "editable_install": true,
+      "environment": {
+        "SAM2_BUILD_CUDA": "0"
+      },
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "sam3",
+      "url": "https://github.com/facebookresearch/sam3.git",
+      "commit": "8f0b7f4d4e7eda2ed606ebde6702c93359ad01da",
+      "recursive": false,
+      "editable_install": true,
+      "license": "SAM 3 License"
+    },
+    {
+      "name": "ProPainter",
+      "url": "https://github.com/sczhou/ProPainter.git",
+      "commit": "e870e79321c31b733e2031af5aa2fb1fe3ac7eec",
+      "recursive": false,
+      "editable_install": false,
+      "license": "NTU S-Lab License 1.0; noncommercial use only"
+    }
+  ],
+  "checkpoints": [
+    {
+      "name": "sam2.1_hiera_small.pt",
+      "destination": "sam2/checkpoints/sam2.1_hiera_small.pt",
+      "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
+      "sha256": "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38",
+      "bytes": 184416285,
+      "required": true
+    },
+    {
+      "name": "sam3.pt",
+      "destination": "sam3/checkpoints/sam3.pt",
+      "huggingface_repo": "facebook/sam3",
+      "huggingface_filename": "sam3.pt",
+      "sha256": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e",
+      "bytes": 3450062241,
+      "gated": true,
+      "required": true
+    },
+    {
+      "name": "ProPainter.pth",
+      "destination": "ProPainter/weights/ProPainter.pth",
+      "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth",
+      "sha256": "12c070c4b48f374c91d8a2a17851140b85c159621080989f9e191bbc18bd6591",
+      "bytes": 157780510,
+      "required": true
+    },
+    {
+      "name": "raft-things.pth",
+      "destination": "ProPainter/weights/raft-things.pth",
+      "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth",
+      "sha256": "fcfa4125d6418f4de95d84aec20a3c5f4e205101715a79f193243c186ac9a7e1",
+      "bytes": 21108000,
+      "required": true
+    },
+    {
+      "name": "recurrent_flow_completion.pth",
+      "destination": "ProPainter/weights/recurrent_flow_completion.pth",
+      "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth",
+      "sha256": "22939a1a7900da878dbe1ccd011d646b1bfb30b8290039d8ff0e0c2fefbfd283",
+      "bytes": 20348681,
+      "required": true
+    }
+  ]
+}

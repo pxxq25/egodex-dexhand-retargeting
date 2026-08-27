@@ -16,7 +16,6 @@ dependencies = [
 
 [project.optional-dependencies]
 egoquest = [
-  "mediapipe>=0.10",
   "pyarrow>=12",
 ]
 test = [

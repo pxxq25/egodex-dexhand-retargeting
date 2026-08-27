@@ -55,51 +55,127 @@ weights, generated videos, or third-party robot assets.
 
 ## Requirements
 
-- Linux with an NVIDIA GPU (the validated environment used CUDA)
-- Python 3.10+
-- FFmpeg
-- The pinned third-party revisions in [THIRD_PARTY.lock.md](THIRD_PARTY.lock.md)
-- SAM3.1 and ProPainter checkpoints listed in that lock file
-- SAPIEN, Pinocchio, PyTorch, and `dex-retargeting`
+- Linux x86_64 with an NVIDIA GPU and driver 560.35.03 or newer
+- Python 3.10 (the validated host used 3.10.12)
+- About 12 GiB of free space for Python wheels, source trees, and checkpoints
+- Hugging Face access to the gated `facebook/sam3` checkpoint
 
 ProPainter is noncommercial research software. UR5e graphical assets also have
 separate use restrictions. Review every upstream license before distributing
 assets or outputs.
 
+## One-command installation
+
+After Hugging Face grants access to `facebook/sam3`, export a read-only token
+and run the bootstrap script from the repository root:
+
+```bash
+HF_TOKEN="${HF_TOKEN}" ./bootstrap.sh --render-device cuda:0
+```
+
+The token is read only by `huggingface-hub`; it is never printed, written to a
+configuration file, copied into the repository, or committed. Standard
+`HTTPS_PROXY`/`HTTP_PROXY` variables are honored for installations behind a
+VPN or proxy.
+
+The command is idempotent and performs the complete setup:
+
+1. Creates isolated Python 3.10 environments for the production pipeline and
+   MediaPipe RGB detector.
+2. Installs the exact Python, PyTorch 2.7.1, CUDA 12.6, and cuDNN 9.5 wheel set
+   from the checked-in lock files.
+3. Clones every production third-party repository at its exact tested commit,
+   including the `dex-retargeting` robot-asset submodule.
+4. Downloads SAM2.1, direct-video SAM3, RAFT, flow-completion, and ProPainter
+   checkpoints and rejects any SHA-256 mismatch.
+5. Verifies imports, repository commits, robot assets, model hashes, NVIDIA
+   driver compatibility, CUDA availability, and the requested SAPIEN/Vulkan
+   device.
+
+Activate the resulting runtime with:
+
+```bash
+source ./activate.sh
+```
+
+Useful setup modes:
+
+```bash
+# Print third-party/model actions without changing anything.
+./bootstrap.sh --dry-run
+
+# Code-only setup for CI; no multi-gigabyte checkpoints.
+./bootstrap.sh --without-models
+
+# Verify an already-cached installation without network access.
+./bootstrap.sh --offline --render-device cuda:0
+```
+
+The authoritative machine-readable locks are:
+
+- [`environment.lock.json`](environment.lock.json): OS, Python, CUDA, driver,
+  container, and critical-import versions
+- [`requirements/pytorch-cu126.lock.txt`](requirements/pytorch-cu126.lock.txt):
+  PyTorch and every CUDA runtime wheel
+- [`requirements/runtime-cu126.lock.txt`](requirements/runtime-cu126.lock.txt):
+  complete primary Python dependency closure
+- [`requirements/mediapipe.lock.txt`](requirements/mediapipe.lock.txt): isolated
+  NumPy 1.26 MediaPipe environment
+- [`third_party.lock.json`](third_party.lock.json): source URLs, commits,
+  checkpoint locations, sizes, and SHA-256 values
+
+MediaPipe is intentionally isolated: version 0.10.21 requires NumPy below 2,
+while `dex-retargeting` and the approved production runtime use NumPy 2.2.6.
+Combining them in one environment is not reproducible.
+
+The pinned SAM3 source declares an older NumPy upper bound, but the approved
+pipeline was validated end-to-end with NumPy 2.2.6. Its editable install is
+therefore performed with dependency resolution disabled, and the verifier
+checks the tested runtime versions directly instead of silently downgrading the
+environment.
+
+### Conda and Docker
+
+[`environment.yml`](environment.yml) provides a pinned Conda entry point for
+the primary Python environment. The bootstrap script remains the authoritative
+full installer because it also creates the MediaPipe sidecar, clones licensed
+assets, downloads gated models, and performs hardware validation.
+
+The Docker image uses a digest-pinned CUDA 12.6.3/cuDNN/Ubuntu 22.04 base and a
+BuildKit secret, so the Hugging Face token does not enter an image layer:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=hf_token,env=HF_TOKEN \
+  -t egodex-dexhand:cu126 .
+
+docker run --rm -it --gpus all --ipc=host \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  egodex-dexhand:cu126
+```
+
 ## Runtime layout
 
-The convenience runner expects this layout by default:
+Bootstrap creates this layout by default:
 
 ```text
 runtime/
 ├── .venv/
+├── .venv-mediapipe/
+├── project -> egodex-dexhand-retargeting/
 ├── egodex-dexhand-retargeting/   # this repository
 └── third_party/
     ├── dex-retargeting/
     ├── sam2/
     │   └── checkpoints/sam2.1_hiera_small.pt
+    ├── sam3/
+    │   └── checkpoints/sam3.pt
     └── ProPainter/
-        └── weights/
+        └── weights/{ProPainter,raft-things,recurrent_flow_completion}.pth
 ```
 
 The locations can be overridden with `EGODEX_DEXHAND_ROOT`,
 `EGODEX_VENV_ROOT`, and `EGODEX_THIRD_PARTY_ROOT`.
-
-## Installation
-
-Create the environment, install this package, and then install each pinned
-third-party project according to its upstream instructions:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e './egodex-dexhand-retargeting[test,egoquest]'
-```
-
-`egoquest` is optional; it installs MediaPipe and PyArrow for the conversion
-utilities. Model downloads remain explicit so checkpoint hashes can be checked
-against [THIRD_PARTY.lock.md](THIRD_PARTY.lock.md).
 
 ## Run the bimanual UR5e + Shadow pipeline
 
@@ -251,9 +327,15 @@ python scripts/run_interact_batch.py status \
 python -m pytest -q
 ```
 
-The tests cover mask/inpaint alignment, render compositing, and temporal
-smoothing. Full integration verification additionally requires the pinned
-third-party models and a sample episode.
+The tests cover setup-lock integrity, credential safety, bootstrap dry-runs,
+mask/inpaint alignment, render compositing, and temporal smoothing. Full
+environment verification is also available independently:
+
+```bash
+python scripts/verify_environment.py \
+  --runtime "$EGODEX_DEXHAND_ROOT" \
+  --require-gpu --render-device cuda:0
+```
 
 ## Current limitations
 
@@ -266,7 +348,7 @@ third-party models and a sample episode.
 
 ## Licensing
 
-No repository-level open-source license has been granted yet. The repository is
-private by default. Third-party code, checkpoints, datasets, and robot assets
-retain their own licenses and are not redistributed here. See
+No repository-level open-source license has been granted yet. Third-party code,
+checkpoints, datasets, and robot assets retain their own licenses and are not
+redistributed here. See
 [THIRD_PARTY.lock.md](THIRD_PARTY.lock.md).
