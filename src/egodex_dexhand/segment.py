@@ -904,10 +904,16 @@ def _signed_mask_distance(mask: np.ndarray, clip_distance: float) -> np.ndarray:
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2:
         raise ValueError(f"binary masks must be 2-D, got {binary.shape}")
-    if not binary.any() or binary.all():
-        raise ValueError("binary masks must contain foreground and background")
     if clip_distance <= 0:
         raise ValueError("clip_distance must be positive")
+    # A valid mask can become uniform after flow warping moves its foreground
+    # entirely outside the reference frame.  Its mathematical signed distance
+    # is then negative (empty) or positive (full) infinity; clipping produces
+    # the corresponding constant field without changing non-uniform masks.
+    if not binary.any():
+        return np.full(binary.shape, -clip_distance, dtype=np.float32)
+    if binary.all():
+        return np.full(binary.shape, clip_distance, dtype=np.float32)
     inside = cv2.distanceTransform(
         binary.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
     )

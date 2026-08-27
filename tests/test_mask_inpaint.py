@@ -21,6 +21,7 @@ def test_propainter_uses_gpu_with_most_free_memory(monkeypatch) -> None:
     assert environment["CUDA_VISIBLE_DEVICES"] == "1"
     assert environment["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 from egodex_dexhand.segment import (
+    _signed_mask_distance,
     _arm_prompt_for_frame,
     _prompt_for_frame,
     adaptive_arm_hand_envelopes,
@@ -32,6 +33,15 @@ from egodex_dexhand.segment import (
 
 
 class TemporalMaskStabilizationTests(unittest.TestCase):
+    def test_uniform_warped_masks_have_clipped_signed_distance(self) -> None:
+        empty = _signed_mask_distance(np.zeros((12, 16), dtype=bool), 7.5)
+        full = _signed_mask_distance(np.ones((12, 16), dtype=bool), 7.5)
+
+        np.testing.assert_array_equal(empty, np.full((12, 16), -7.5))
+        np.testing.assert_array_equal(full, np.full((12, 16), 7.5))
+        self.assertEqual(empty.dtype, np.float32)
+        self.assertEqual(full.dtype, np.float32)
+
     def test_appearance_refinement_rejects_differently_colored_leak(self) -> None:
         width, height, count = 180, 110, 5
         hand_sequence = np.zeros((count, 21, 3), dtype=np.float32)
