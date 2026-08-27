@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sys
@@ -16,6 +15,7 @@ from .data import (
     scaled_intrinsic,
 )
 from .inpaint import run_propainter
+from .provenance import sha256_file as _sha256
 from .render import render_robot_sequence
 from .retarget import retarget_position_sequence, save_retarget_result
 from .segment import segment_hand_video
@@ -42,6 +42,11 @@ def _parse_args() -> argparse.Namespace:
         "--sam2-size", choices=("tiny", "small", "base_plus", "large"), default="small"
     )
     parser.add_argument("--prompt-stride", type=int, default=10)
+    parser.add_argument(
+        "--render-device",
+        required=True,
+        help="explicit SAPIEN Vulkan device, for example cuda:0",
+    )
     prompt_group = parser.add_mutually_exclusive_group()
     prompt_group.add_argument(
         "--sam2-box-prompt",
@@ -70,14 +75,6 @@ def _stage_enabled(name: str, args: argparse.Namespace) -> bool:
 def _require(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"required stage artifact is missing: {path}")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _run_provenance(args: argparse.Namespace) -> dict[str, object]:
@@ -215,6 +212,7 @@ def main() -> None:
             height=height,
             output_dir=render_dir,
             fps=fps,
+            render_device=args.render_device,
         )
     _require(render_dir / "robot_rgb.mp4")
     if _stopped_after("render", args, output):

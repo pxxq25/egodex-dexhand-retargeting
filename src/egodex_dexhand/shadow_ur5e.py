@@ -147,6 +147,9 @@ def solve_ur5e_arm_sequence(
     world_from_camera: np.ndarray,
     combined_urdf: str | Path,
     q_reference: np.ndarray | None = None,
+    initial_qpos: np.ndarray | None = None,
+    base_translation_world: np.ndarray | None = None,
+    base_rotation_world: np.ndarray | None = None,
 ) -> UR5eArmResult:
     """Solve UR5e IK so its mounted Shadow forearm matches retargeting exactly."""
 
@@ -204,6 +207,13 @@ def solve_ur5e_arm_sequence(
         if q_reference.shape != (6,) or not np.isfinite(q_reference).all():
             raise ValueError("UR5e reference posture must be a finite 6-vector")
     q_reference = np.clip(q_reference, lower + 1e-4, upper - 1e-4)
+    if initial_qpos is not None:
+        initial_qpos = np.asarray(initial_qpos, dtype=np.float64)
+        if initial_qpos.shape != (6,) or not np.isfinite(initial_qpos).all():
+            raise ValueError("initial UR5e qpos must be a finite 6-vector")
+        initial_qpos = np.clip(initial_qpos, lower + 1e-4, upper - 1e-4)
+    if (base_translation_world is None) != (base_rotation_world is None):
+        raise ValueError("persisted UR5e base translation and rotation are a pair")
     neutral = np.asarray(pin.neutral(model), dtype=np.float64)
 
     def forearm_pose(arm_qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -219,14 +229,31 @@ def solve_ur5e_arm_sequence(
     # Anchor the model at the middle of the clip.  This reference posture keeps
     # the UR5e base and proximal links offscreen while its distal links enter
     # through the same lower-right border as the captured human sleeve.
-    anchor = (frame_count - 1) // 2
-    position_base_reference, rotation_base_reference = forearm_pose(q_reference)
-    base_rotation_world = (
-        rotations_world[anchor] @ rotation_base_reference.T
-    )
-    base_translation_world = (
-        positions_world[anchor] - base_rotation_world @ position_base_reference
-    )
+    if base_translation_world is None:
+        anchor = (frame_count - 1) // 2
+        position_base_reference, rotation_base_reference = forearm_pose(q_reference)
+        base_rotation_world = rotations_world[anchor] @ rotation_base_reference.T
+        base_translation_world = (
+            positions_world[anchor] - base_rotation_world @ position_base_reference
+        )
+    else:
+        # Keeping the same physical base is essential: changing it at every
+        # chunk lets the redundant elbow/wrist chain visibly flip even when
+        # the end-effector target is continuous.
+        anchor = 0
+        base_translation_world = np.asarray(
+            base_translation_world, dtype=np.float64
+        )
+        base_rotation_world = np.asarray(base_rotation_world, dtype=np.float64)
+        if base_translation_world.shape != (3,):
+            raise ValueError("persisted UR5e base translation must be a 3-vector")
+        if base_rotation_world.shape != (3, 3):
+            raise ValueError("persisted UR5e base rotation must be 3x3")
+        if not (
+            np.isfinite(base_translation_world).all()
+            and np.isfinite(base_rotation_world).all()
+        ):
+            raise ValueError("persisted UR5e base pose must be finite")
 
     positions_base = (
         base_rotation_world.T
@@ -267,11 +294,25 @@ def solve_ur5e_arm_sequence(
             raise RuntimeError(f"UR5e IK returned non-finite values at {frame_index}")
         return np.clip(solution.x, lower, upper)
 
-    previous = q_reference
+    def wrapped_distance(candidate: np.ndarray, previous: np.ndarray) -> float:
+        delta = np.arctan2(np.sin(candidate - previous), np.cos(candidate - previous))
+        return float(np.linalg.norm(delta))
+
+    if initial_qpos is not None:
+        # Evaluate the persisted branch and the configured fallback, then keep
+        # the feasible solution nearest to the prior state on the angle torus.
+        candidates = [solve_frame(anchor, initial_qpos)]
+        if wrapped_distance(q_reference, initial_qpos) > 1e-6:
+            candidates.append(solve_frame(anchor, q_reference))
+        q_frames[anchor] = min(
+            candidates, key=lambda value: wrapped_distance(value, initial_qpos)
+        )
+
+    previous = q_frames[anchor]
     for frame_index in range(anchor + 1, frame_count):
         q_frames[frame_index] = solve_frame(frame_index, previous)
         previous = q_frames[frame_index]
-    previous = q_reference
+    previous = q_frames[anchor]
     for frame_index in range(anchor - 1, -1, -1):
         q_frames[frame_index] = solve_frame(frame_index, previous)
         previous = q_frames[frame_index]

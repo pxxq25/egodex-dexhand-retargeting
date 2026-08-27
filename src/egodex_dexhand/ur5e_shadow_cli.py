@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sys
@@ -9,6 +8,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+
+from .chunk_continuity import (
+    last_state,
+    load_chunk_continuity_state,
+    save_chunk_continuity_state,
+    smooth_wrapped_joint_boundary,
+    trailing_context,
+)
 
 from .compose import composite_videos
 from .data import (
@@ -20,6 +27,7 @@ from .data import (
     scaled_intrinsic,
 )
 from .inpaint import run_propainter
+from .provenance import sha256_file as _sha256
 from .render import render_ur5e_shadow_sequence
 from .retarget import retarget_position_sequence, save_retarget_result
 from .segment import segment_arm_hand_video
@@ -72,10 +80,23 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt-stride", type=int, default=1)
     parser.add_argument(
+        "--render-device",
+        required=True,
+        help="explicit SAPIEN Vulkan device, for example cuda:2",
+    )
+    parser.add_argument(
         "--hide-arm-visual-link",
         action="append",
         default=[],
         help="UR5e link whose visual mesh is omitted (repeatable)",
+    )
+    parser.add_argument(
+        "--allow-hidden-arm",
+        action="store_true",
+        help=(
+            "accept a visible Shadow hand when intentionally hidden proximal "
+            "arm visuals produce no arm-mask pixels"
+        ),
     )
     parser.add_argument(
         "--arm-q-reference",
@@ -86,6 +107,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start-stage", choices=STAGES, default="prepare")
     parser.add_argument("--stop-stage", choices=STAGES, default="compose")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--initial-continuity-state", type=Path)
+    parser.add_argument("--write-continuity-state", type=Path)
+    parser.add_argument("--continuity-source-frame", type=int, default=-1)
+    parser.add_argument("--continuity-margin-frames", type=int, default=12)
     add_temporal_smoothing_arguments(parser)
     return parser.parse_args()
 
@@ -93,14 +118,6 @@ def _parse_args() -> argparse.Namespace:
 def _enabled(name: str, args: argparse.Namespace) -> bool:
     index = STAGES.index(name)
     return STAGES.index(args.start_stage) <= index <= STAGES.index(args.stop_stage)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _provenance(args: argparse.Namespace) -> dict[str, object]:
@@ -148,6 +165,7 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "temporal_smoothing": smoothing_config.to_dict(),
         "shadow_root_smoothing": "preserve_dummy_q_and_smooth_forearm_se3",
         "hidden_arm_visual_links": list(args.hide_arm_visual_link),
+        "require_arm_visibility": not args.allow_hidden_arm,
         "arm_q_reference": args.arm_q_reference,
     }
 
@@ -172,6 +190,7 @@ def _stop(name: str, args: argparse.Namespace, output: Path) -> bool:
 
 def main() -> None:
     args = _parse_args()
+    continuity_state = load_chunk_continuity_state(args.initial_continuity_state)
     smoothing_config = temporal_smoothing_config_from_args(args)
     if STAGES.index(args.start_stage) > STAGES.index(args.stop_stage):
         raise ValueError("--start-stage must not come after --stop-stage")
@@ -257,6 +276,19 @@ def main() -> None:
         width / int(metadata["source_width"]),
         height / int(metadata["source_height"]),
     )
+    require_robot_visibility = bool(
+        projected_hand_visibility(
+            visibility_sequence.joints_camera_cv,
+            scaled_intrinsic(
+                visibility_sequence.intrinsic,
+                width / int(metadata["source_width"]),
+                height / int(metadata["source_height"]),
+            ),
+            width,
+            height,
+            joint_confidence=visibility_sequence.joint_confidence,
+        ).any()
+    )
 
     if _enabled("retarget", args):
         hand_result = retarget_position_sequence(
@@ -265,6 +297,11 @@ def main() -> None:
             robot="shadow",
             hand=args.hand,
             preroll=10,
+            initial_qpos=(
+                None if continuity_state is None else continuity_state.hand_qpos
+                if continuity_state.hand_qpos.ndim == 1
+                else last_state(continuity_state.hand_qpos)
+            ),
         )
         hand_result = replace(
             hand_result,
@@ -276,6 +313,17 @@ def main() -> None:
                 config=smoothing_config,
             ),
         )
+        if continuity_state is not None:
+            hand_result = replace(
+                hand_result,
+                qpos=smooth_wrapped_joint_boundary(
+                    continuity_state.hand_qpos,
+                    hand_result.qpos,
+                    margin_frames=args.continuity_margin_frames,
+                    lower=hand_result.joint_limits[:, 0],
+                    upper=hand_result.joint_limits[:, 1],
+                ),
+            )
         save_retarget_result(hand_file, hand_result)
         prepare_ur5e_shadow_urdf(args.combined_urdf, derived_urdf)
         targets = extract_shadow_forearm_targets(
@@ -301,8 +349,49 @@ def main() -> None:
             world_from_camera=arm_sequence.world_from_camera,
             combined_urdf=derived_urdf,
             q_reference=args.arm_q_reference,
+            initial_qpos=(
+                None if continuity_state is None else last_state(continuity_state.arm_qpos)
+            ),
+            base_translation_world=(
+                None
+                if continuity_state is None
+                else continuity_state.base_translation_world
+            ),
+            base_rotation_world=(
+                None
+                if continuity_state is None
+                else continuity_state.base_rotation_world
+            ),
         )
+        if continuity_state is not None:
+            arm_result = replace(
+                arm_result,
+                qpos=smooth_wrapped_joint_boundary(
+                    continuity_state.arm_qpos,
+                    arm_result.qpos,
+                    margin_frames=args.continuity_margin_frames,
+                    lower=arm_result.joint_limits[:, 0],
+                    upper=arm_result.joint_limits[:, 1],
+                ),
+            )
         save_ur5e_arm_result(arm_file, arm_result)
+        if args.write_continuity_state is not None:
+            save_chunk_continuity_state(
+                args.write_continuity_state,
+                hand_qpos=trailing_context(
+                    None if continuity_state is None else continuity_state.hand_qpos,
+                    hand_result.qpos,
+                    args.continuity_margin_frames,
+                ),
+                arm_qpos=trailing_context(
+                    None if continuity_state is None else continuity_state.arm_qpos,
+                    arm_result.qpos,
+                    args.continuity_margin_frames,
+                ),
+                base_translation_world=arm_result.base_translation_world,
+                base_rotation_world=arm_result.base_rotation_world,
+                source_frame=args.continuity_source_frame,
+            )
         print(
             f"retargeted {len(hand_result.qpos)} frames; UR5e forearm error "
             f"median={np.median(arm_result.position_error) * 1000:.2f} mm, "
@@ -334,6 +423,9 @@ def main() -> None:
             output_dir=render_dir,
             fps=fps,
             hidden_arm_visual_links=tuple(args.hide_arm_visual_link),
+            render_device=args.render_device,
+            require_robot_visibility=require_robot_visibility,
+            require_arm_visibility=not args.allow_hidden_arm,
         )
     _require(render_dir / "robot_rgb.mp4")
     if _stop("render", args, output):

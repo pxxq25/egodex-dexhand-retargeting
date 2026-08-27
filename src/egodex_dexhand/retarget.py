@@ -22,6 +22,7 @@ def retarget_position_sequence(
     robot: str = "allegro",
     hand: str = "right",
     preroll: int = 0,
+    initial_qpos: np.ndarray | None = None,
 ) -> RetargetResult:
     """Run dex-retargeting's real offline POSITION optimizer.
 
@@ -69,6 +70,19 @@ def retarget_position_sequence(
         hand_type=hand_enum,
         is_mano_convention=True,
     )
+    if initial_qpos is not None:
+        initial_qpos = np.asarray(initial_qpos, dtype=np.float32)
+        if initial_qpos.shape != (retargeting.optimizer.robot.dof,):
+            raise ValueError(
+                "initial Shadow qpos must match the optimizer robot DOF: "
+                f"expected {(retargeting.optimizer.robot.dof,)}, got "
+                f"{initial_qpos.shape}"
+            )
+        if not np.isfinite(initial_qpos).all():
+            raise ValueError("initial Shadow qpos must be finite")
+        # SeqRetargeting stores only the optimizer-controlled joints.  Its
+        # public setter performs the correct Pinocchio/adaptor indexing.
+        retargeting.set_qpos(initial_qpos)
     target_indices = np.asarray(
         retargeting.optimizer.target_link_human_indices, dtype=np.int64
     )
@@ -76,7 +90,10 @@ def retarget_position_sequence(
     # The floating-root optimizer can otherwise expose its cold-start pose as
     # frame 0. Repeating the first observation converges that internal state
     # without changing any input data or requiring training.
-    for _ in range(max(0, int(preroll))):
+    # A persisted state is already converged. Replaying frame zero would pull
+    # it away from the preceding chunk before the first output frame.
+    effective_preroll = 0 if initial_qpos is not None else max(0, int(preroll))
+    for _ in range(effective_preroll):
         retargeting.retarget(joints_sapien[0, target_indices])
 
     qpos_frames = []

@@ -51,6 +51,44 @@ def transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     return result.astype(np.float32)
 
 
+def hts_projection_params(
+    session: dict, width: int, height: int
+) -> tuple[float, float, float, float]:
+    """Reproduce the frozen HTS calibration-viewport projection."""
+
+    calibration = session.get("camera_calibration") or {}
+    defaults = session.get("projection_defaults", {}) or {}
+    focal = calibration.get("focal_length") or [
+        defaults.get("fx", 854.844970703125),
+        defaults.get("fy", 854.844970703125),
+    ]
+    principal = calibration.get("principal_point") or [
+        defaults.get("cx", 642.5776977539062),
+        defaults.get("cy", 645.1429443359375),
+    ]
+    sensor = (
+        calibration.get("sensor_resolution")
+        or calibration.get("current_resolution")
+        or [width, height]
+    )
+    current = calibration.get("current_resolution") or [width, height]
+    sensor_array = np.asarray(sensor, dtype=np.float64)
+    current_array = np.asarray(current, dtype=np.float64)
+    scale = current_array / sensor_array
+    scale /= max(float(scale[0]), float(scale[1]))
+    crop_xy = sensor_array * (1.0 - scale) * 0.5
+    crop_wh = sensor_array * scale
+    fx = float(focal[0]) * float(width) / float(crop_wh[0])
+    fy = float(focal[1]) * float(height) / float(crop_wh[1])
+    cx = (float(principal[0]) - float(crop_xy[0])) * float(width) / float(crop_wh[0])
+    cy = float(height) - (
+        (float(principal[1]) - float(crop_xy[1]))
+        * float(height)
+        / float(crop_wh[1])
+    )
+    return fx, fy, cx, cy
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("recording", type=Path)
@@ -63,7 +101,9 @@ def main() -> None:
     args = parser.parse_args()
 
     session = json.loads((args.recording / "session.json").read_text())
-    table = pq.read_table(args.recording / "aligned_frames.parquet").slice(
+    table = pq.read_table(args.recording / "aligned_frames.parquet").sort_by(
+        [("camera_frame_index", "ascending")]
+    ).slice(
         args.start_frame,
         None if args.end_frame is None else args.end_frame - args.start_frame,
     )
@@ -90,20 +130,17 @@ def main() -> None:
     )
     world_from_camera = transform(camera_rotation_cv, camera_position)
 
-    calibration = session["camera_calibration"]
-    source_width, source_height = calibration["current_resolution"]
     video_resolution = session.get("video_resolution")
     if video_resolution is None:
-        video_width, video_height = int(source_width), int(source_height)
+        calibration = session["camera_calibration"]
+        video_width, video_height = map(int, calibration["current_resolution"])
     else:
         video_width = int(video_resolution["width"])
         video_height = int(video_resolution["height"])
-    scale_x, scale_y = video_width / source_width, video_height / source_height
-    fx, fy = calibration["focal_length"]
-    cx, cy = calibration["principal_point"]
+    fx, fy, cx, cy = hts_projection_params(session, video_width, video_height)
     intrinsic = np.asarray(
-        [[fx * scale_x, 0.0, cx * scale_x],
-         [0.0, fy * scale_y, cy * scale_y],
+        [[fx, 0.0, cx],
+         [0.0, fy, cy],
          [0.0, 0.0, 1.0]],
         dtype=np.float32,
     )
@@ -114,8 +151,22 @@ def main() -> None:
         landmarks_unity = np.asarray(
             rows[f"{side}_landmarks_world"], dtype=np.float64
         ).reshape(count, 21, 3)
-        hand_world[side] = np.einsum(
-            "ij,tkj->tki", world_basis, landmarks_unity
+        # Frozen Object Interaction route:
+        #   p_camera_unity = (p_world - camera_position) @ R_camera_xyzw
+        # Convert only the camera Y axis to OpenCV's down-positive convention.
+        # The internally stored world points are rebuilt through our proper
+        # renderer camera transform, so inv(T_world_camera) recovers these
+        # exact HTS camera coordinates without placing a reflection in SE(3).
+        points_camera_unity = np.einsum(
+            "tkj,tji->tki",
+            landmarks_unity - camera_position_unity[:, None, :],
+            camera_rotation_unity,
+        )
+        points_camera_cv = points_camera_unity.copy()
+        points_camera_cv[..., 1] *= -1.0
+        hand_world[side] = (
+            np.einsum("tij,tkj->tki", camera_rotation_cv, points_camera_cv)
+            + camera_position[:, None, :]
         )
         rotation_unity = Rotation.from_quat(
             np.asarray(rows[f"{side}_wrist_quaternion"], dtype=np.float64)
@@ -133,6 +184,12 @@ def main() -> None:
         handle.attrs["source_start_frame"] = args.start_frame
         handle.attrs["source_end_frame"] = args.start_frame + count
         handle.attrs["active_hand"] = args.active_hand
+        handle.attrs["camera_coordinate_processing"] = (
+            "hts_calibration_viewport_object_interaction_20260720"
+        )
+        handle.attrs["camera_coordinate_formula"] = (
+            "(world-camera_position)@R_camera_xyzw; y_flipped_for_opencv"
+        )
 
         active_sides = (
             ("left", "right") if args.active_hand == "both" else (args.active_hand,)

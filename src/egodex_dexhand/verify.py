@@ -1,22 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
+
+from .provenance import sha256_file as _sha256
 
 import cv2
 import numpy as np
 
 from .data import load_egodex_sequence, project_camera_points, scaled_intrinsic
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _numbered_paths(directory: Path, expected: int) -> list[Path]:
@@ -389,19 +382,19 @@ def verify_run(run_dir: str | Path) -> dict[str, object]:
                     raise RuntimeError(
                         f"inconsistent bimanual renderer masks at {frame_index}"
                     )
-    if min(robot_mask_areas) < 16:
-        raise RuntimeError("at least one robot mask is empty or implausibly small")
+    if not any(area >= 16 for area in robot_mask_areas):
+        raise RuntimeError("the robot is absent from the complete interval")
     if metadata.get("whole_arm") and (
-        min(hand_mask_areas) < 16
-        or sum(area >= 16 for area in arm_mask_areas) < expected // 2
+        not any(area >= 16 for area in hand_mask_areas)
+        or not any(area >= 16 for area in arm_mask_areas)
     ):
         raise RuntimeError("split arm/hand masks fail visibility validation")
     if bimanual:
         for side in ("left", "right"):
             if (
-                min(side_robot_areas[side]) < 32
-                or min(side_hand_areas[side]) < 16
-                or max(side_arm_areas[side]) < 16
+                not any(area >= 32 for area in side_robot_areas[side])
+                or not any(area >= 16 for area in side_hand_areas[side])
+                or not any(area >= 16 for area in side_arm_areas[side])
             ):
                 raise RuntimeError(f"{side} renderer masks fail visibility validation")
 

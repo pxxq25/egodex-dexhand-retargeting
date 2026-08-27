@@ -2,18 +2,141 @@ from __future__ import annotations
 
 import unittest
 
+import cv2
 import numpy as np
+from unittest.mock import Mock, patch
 
-from egodex_dexhand.inpaint import blend_inpainted_frame, soft_inpaint_alpha
+from egodex_dexhand.inpaint import (
+    blend_inpainted_frame,
+    propainter_environment,
+    soft_inpaint_alpha,
+)
+
+
+def test_propainter_uses_gpu_with_most_free_memory(monkeypatch) -> None:
+    monkeypatch.delenv("EGODEX_INPAINT_CUDA_VISIBLE_DEVICES", raising=False)
+    probe = Mock(stdout="0, 12000\n1, 70000\n2, 30000\n")
+    with patch("egodex_dexhand.inpaint.subprocess.run", return_value=probe):
+        environment = propainter_environment()
+    assert environment["CUDA_VISIBLE_DEVICES"] == "1"
+    assert environment["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 from egodex_dexhand.segment import (
     _arm_prompt_for_frame,
     _prompt_for_frame,
+    adaptive_arm_hand_envelopes,
+    appearance_refine_arm_hand_masks,
+    arm_hand_geometry_envelope,
     stabilize_binary_mask_sequence,
     tracked_hand_support_mask,
 )
 
 
 class TemporalMaskStabilizationTests(unittest.TestCase):
+    def test_appearance_refinement_rejects_differently_colored_leak(self) -> None:
+        width, height, count = 180, 110, 5
+        hand_sequence = np.zeros((count, 21, 3), dtype=np.float32)
+        arm_sequence = np.zeros((count, 4, 3), dtype=np.float32)
+        frames = []
+        masks = []
+        for frame_index in range(count):
+            wrist = np.asarray([95.0, 55.0, 1.0], np.float32)
+            hand_sequence[frame_index, :, :] = wrist
+            hand_sequence[frame_index, :, 0] += np.linspace(-10.0, 10.0, 21)
+            arm_sequence[frame_index, :, 2] = 1.0
+            arm_sequence[frame_index, 2, :2] = (20.0, 80.0)
+            arm_sequence[frame_index, 3] = wrist
+            frame = np.full((height, width, 3), (70, 145, 190), np.uint8)
+            cv2.line(frame, (0, 80), (95, 55), (25, 25, 25), 42)
+            cv2.circle(frame, (95, 55), 22, (120, 155, 195), -1)
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.line(mask, (0, 80), (95, 55), 1, 42)
+            cv2.circle(mask, (95, 55), 22, 1, -1)
+            if frame_index == count - 1:
+                mask[5:38, 5:80] = 1
+            frames.append(frame)
+            masks.append(mask > 0)
+
+        refined, _, _, _ = appearance_refine_arm_hand_masks(
+            masks,
+            frames,
+            hand_sequence,
+            arm_sequence,
+            np.eye(3, dtype=np.float32),
+            width,
+            height,
+        )
+
+        self.assertTrue(refined[-1][80, 10])
+        self.assertTrue(refined[-1][55, 95])
+        self.assertFalse(refined[-1][10:30, 10:70].any())
+
+    def test_adaptive_envelope_learns_reference_sleeve_width(self) -> None:
+        width, height, count = 180, 110, 5
+        hand_sequence = np.zeros((count, 21, 3), dtype=np.float32)
+        arm_sequence = np.zeros((count, 4, 3), dtype=np.float32)
+        masks = []
+        for frame_index in range(count):
+            wrist = np.asarray(
+                [95.0 + frame_index, 35.0 + 5.0 * frame_index, 1.0], np.float32
+            )
+            hand_sequence[frame_index, :, :] = wrist
+            hand_sequence[frame_index, :, 0] += np.linspace(-10.0, 10.0, 21)
+            arm_sequence[frame_index, :, 2] = 1.0
+            arm_sequence[frame_index, 2, :2] = (20.0, 80.0)
+            arm_sequence[frame_index, 3] = wrist
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.line(mask, (0, 80), tuple(wrist[:2].astype(int)), 1, 42)
+            cv2.circle(mask, tuple(wrist[:2].astype(int)), 22, 1, -1)
+            masks.append(mask > 0)
+
+        envelopes, reference, radii = adaptive_arm_hand_envelopes(
+            masks,
+            hand_sequence,
+            arm_sequence,
+            np.eye(3, dtype=np.float32),
+            width,
+            height,
+            profile_margin=2.0,
+        )
+
+        self.assertIn(reference, range(count))
+        self.assertEqual(len(envelopes), count)
+        self.assertEqual(len(radii), 12)
+        self.assertTrue(
+            all(
+                envelope[
+                    int(hand_sequence[index, 0, 1]),
+                    int(hand_sequence[index, 0, 0]),
+                ]
+                for index, envelope in enumerate(envelopes)
+            )
+        )
+        self.assertFalse(any(envelope[8, 90] for envelope in envelopes))
+
+    def test_arm_geometry_envelope_rejects_lateral_table_region(self) -> None:
+        width, height = 160, 100
+        hand = np.zeros((21, 3), dtype=np.float32)
+        hand[:, :] = (88.0, 54.0, 1.0)
+        hand[:, 0] += np.linspace(-12.0, 12.0, 21)
+        arm = np.zeros((4, 3), dtype=np.float32)
+        arm[:, 2] = 1.0
+        arm[2, :2] = (25.0, 95.0)
+        arm[3, :2] = (82.0, 58.0)
+
+        envelope = arm_hand_geometry_envelope(
+            hand,
+            arm,
+            np.eye(3, dtype=np.float32),
+            width,
+            height,
+            corridor_radius=18,
+        )
+
+        self.assertTrue(envelope[58, 82])
+        self.assertTrue(envelope[94, 26])
+        self.assertFalse(envelope[12, 28])
+        self.assertFalse(envelope[18, 138])
+
     def test_tracked_hand_support_covers_thin_pointing_finger(self) -> None:
         joints = np.zeros((21, 3), dtype=np.float32)
         joints[:, 2] = 1.0
@@ -133,6 +256,13 @@ class TemporalMaskStabilizationTests(unittest.TestCase):
 
 
 class SoftInpaintSeamTests(unittest.TestCase):
+    def test_empty_mask_is_a_zero_alpha_noop(self) -> None:
+        alpha = soft_inpaint_alpha(np.zeros((16, 20), dtype=np.uint8))
+
+        self.assertEqual(alpha.dtype, np.float32)
+        self.assertEqual(alpha.shape, (16, 20))
+        self.assertFalse(alpha.any())
+
     def test_default_has_six_solid_and_four_soft_pixels(self) -> None:
         mask = np.zeros((64, 64), dtype=np.uint8)
         mask[20:30, 20:30] = 255

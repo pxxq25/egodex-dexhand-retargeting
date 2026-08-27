@@ -53,6 +53,11 @@ def main() -> None:
     parser.add_argument("--min-detection-confidence", type=float, default=0.2)
     parser.add_argument("--brightness-gain", type=float, default=1.0)
     parser.add_argument("--brightness-offset", type=float, default=0.0)
+    parser.add_argument(
+        "--allow-missing-hands",
+        action="store_true",
+        help="write zero-confidence tracks when a requested side is never detected",
+    )
     args = parser.parse_args()
 
     capture = cv2.VideoCapture(str(args.video))
@@ -116,7 +121,15 @@ def main() -> None:
     confidence: dict[str, np.ndarray] = {}
     for side in ("left", "right"):
         if side in active_sides:
-            filled[side], confidence[side] = interpolate_track(tracks[side], direct[side])
+            if direct[side].any():
+                filled[side], confidence[side] = interpolate_track(
+                    tracks[side], direct[side]
+                )
+            elif args.allow_missing_hands:
+                filled[side] = np.zeros((count, 21, 2), dtype=np.float32)
+                confidence[side] = np.zeros(count, dtype=np.float32)
+            else:
+                raise RuntimeError(f"RGB detector never found the {side} hand")
         else:
             filled[side] = np.zeros((count, 21, 2), dtype=np.float32)
             confidence[side] = np.zeros(count, dtype=np.float32)

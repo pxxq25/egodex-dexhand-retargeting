@@ -77,6 +77,471 @@ def tracked_hand_support_mask(
     return support.astype(bool)
 
 
+def arm_hand_geometry_envelope(
+    hand_joints_camera_cv: np.ndarray,
+    arm_joints_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    corridor_radius: int | None = None,
+) -> np.ndarray:
+    """Return a conservative per-frame support envelope for a hand and sleeve.
+
+    This is the arm analogue of PHANTOM's per-frame hand-box clamp. A broad,
+    oriented capsule follows the measured wrist-to-elbow ray to the image
+    boundary, while the projected hand skeleton preserves fingers outside that
+    capsule. Intersecting a SAM mask with this envelope prevents an ambiguous
+    border-connected sleeve prompt from absorbing a table or work surface.
+    """
+
+    hand = np.asarray(hand_joints_camera_cv, dtype=np.float32)
+    arm = np.asarray(arm_joints_camera_cv, dtype=np.float32)
+    if hand.shape != (21, 3):
+        raise ValueError(f"expected 21 hand joints, got {hand.shape}")
+    if arm.shape != (4, 3):
+        raise ValueError(f"expected 4 arm joints, got {arm.shape}")
+
+    hand_pixels = project_camera_points(hand, intrinsic)
+    arm_pixels = project_camera_points(arm, intrinsic)
+
+    def in_frame(point: np.ndarray) -> bool:
+        return bool(
+            np.isfinite(point).all()
+            and 0 <= point[0] <= width - 1
+            and 0 <= point[1] <= height - 1
+        )
+
+    wrist = arm_pixels[3]
+    elbow = arm_pixels[2]
+    if in_frame(wrist):
+        base = wrist.astype(np.float32)
+    else:
+        knuckles = hand_pixels[[5, 9, 13, 17]]
+        visible_knuckles = np.asarray([in_frame(point) for point in knuckles])
+        if np.any(visible_knuckles):
+            base = np.mean(knuckles[visible_knuckles], axis=0).astype(np.float32)
+        else:
+            visible_hand = np.asarray([in_frame(point) for point in hand_pixels])
+            if not np.any(visible_hand):
+                raise RuntimeError("no visible hand anchor for geometry envelope")
+            base = np.mean(hand_pixels[visible_hand], axis=0).astype(np.float32)
+
+    direction = elbow - wrist
+    endpoint = _ray_to_image_border(base, direction, width, height)
+    if corridor_radius is None:
+        visible_hand = np.asarray([in_frame(point) for point in hand_pixels])
+        if np.count_nonzero(visible_hand) >= 2:
+            extent = hand_pixels[visible_hand]
+            palm_scale = float(np.linalg.norm(extent.max(axis=0) - extent.min(axis=0)))
+        else:
+            palm_scale = 0.0
+        corridor_radius = int(
+            round(
+                np.clip(
+                    max(min(width, height) * 0.13, palm_scale * 0.55),
+                    58.0,
+                    92.0,
+                )
+            )
+        )
+
+    envelope = np.zeros((height, width), dtype=np.uint8)
+    start = tuple(np.rint(base).astype(np.int32))
+    end = tuple(np.rint(endpoint).astype(np.int32))
+    cv2.line(
+        envelope,
+        start,
+        end,
+        1,
+        2 * int(corridor_radius),
+        cv2.LINE_AA,
+    )
+    cv2.circle(envelope, start, int(corridor_radius), 1, -1, cv2.LINE_AA)
+    cv2.circle(envelope, end, int(corridor_radius), 1, -1, cv2.LINE_AA)
+
+    # Keep a generously dilated hand skeleton so fingertips and an open palm
+    # are never lost merely because they lie perpendicular to the forearm ray.
+    hand_support = tracked_hand_support_mask(
+        hand,
+        intrinsic,
+        width,
+        height,
+        radius=max(8, int(round(min(width, height) * 0.04))),
+    )
+    return (envelope > 0) | hand_support
+
+
+def _arm_axis_for_frame(
+    hand_joints_camera_cv: np.ndarray,
+    arm_joints_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Recover the visible wrist-to-image-border arm axis for one frame."""
+
+    hand_pixels = project_camera_points(hand_joints_camera_cv, intrinsic)
+    arm_pixels = project_camera_points(arm_joints_camera_cv, intrinsic)
+
+    def in_frame(point: np.ndarray) -> bool:
+        return bool(
+            np.isfinite(point).all()
+            and 0 <= point[0] <= width - 1
+            and 0 <= point[1] <= height - 1
+        )
+
+    wrist = arm_pixels[3]
+    elbow = arm_pixels[2]
+    if in_frame(wrist):
+        base = wrist.astype(np.float32)
+    else:
+        knuckles = hand_pixels[[5, 9, 13, 17]]
+        valid_knuckles = np.asarray([in_frame(point) for point in knuckles])
+        if np.any(valid_knuckles):
+            base = np.mean(knuckles[valid_knuckles], axis=0).astype(np.float32)
+        else:
+            valid_hand = np.asarray([in_frame(point) for point in hand_pixels])
+            if not np.any(valid_hand):
+                raise RuntimeError("no visible hand anchor for arm axis")
+            base = np.mean(hand_pixels[valid_hand], axis=0).astype(np.float32)
+    endpoint = _ray_to_image_border(base, elbow - wrist, width, height)
+    return base, endpoint
+
+
+def adaptive_arm_hand_envelopes(
+    raw_masks: list[np.ndarray] | tuple[np.ndarray, ...],
+    hand_joints_camera_cv: np.ndarray,
+    arm_joints_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    profile_bins: int = 12,
+    profile_margin: float = 12.0,
+) -> tuple[list[np.ndarray], int, np.ndarray]:
+    """Measure sleeve width once and transfer it through projected arm motion.
+
+    The reference is the frame whose projected hand center is farthest from an
+    image boundary, following PHANTOM's seed selection. Cross-sections of that
+    frame's SAM mask provide an image-derived sleeve radius profile. The profile
+    is then rendered along every frame's measured arm axis and mildly rescaled
+    by projected hand size. Hand keypoints are protected separately.
+    """
+
+    masks = [np.asarray(mask, dtype=bool) for mask in raw_masks]
+    count = len(masks)
+    if count == 0:
+        raise ValueError("at least one raw mask is required")
+    if len(hand_joints_camera_cv) != count or len(arm_joints_camera_cv) != count:
+        raise ValueError("mask and joint sequence lengths differ")
+    if profile_bins < 4:
+        raise ValueError("profile_bins must be at least four")
+
+    axes: list[tuple[np.ndarray, np.ndarray]] = []
+    edge_margins: list[float] = []
+    hand_scales: list[float] = []
+    for frame_index in range(count):
+        base, endpoint = _arm_axis_for_frame(
+            hand_joints_camera_cv[frame_index],
+            arm_joints_camera_cv[frame_index],
+            intrinsic,
+            width,
+            height,
+        )
+        axes.append((base, endpoint))
+        pixels = project_camera_points(hand_joints_camera_cv[frame_index], intrinsic)
+        valid = np.isfinite(pixels).all(axis=1)
+        valid &= hand_joints_camera_cv[frame_index, :, 2] > 1e-4
+        valid &= (pixels[:, 0] >= 0) & (pixels[:, 0] < width)
+        valid &= (pixels[:, 1] >= 0) & (pixels[:, 1] < height)
+        if np.any(valid):
+            extent = pixels[valid]
+            center = np.mean(extent, axis=0)
+            edge_margins.append(
+                float(
+                    min(
+                        center[0],
+                        width - 1 - center[0],
+                        center[1],
+                        height - 1 - center[1],
+                    )
+                )
+            )
+            hand_scales.append(
+                max(1.0, float(np.linalg.norm(extent.max(axis=0) - extent.min(axis=0))))
+            )
+        else:
+            edge_margins.append(-1.0)
+            hand_scales.append(1.0)
+
+    # PHANTOM uses only maximum distance from the image edge. That can still
+    # pick an already oversegmented frame when the hand is central. Retain all
+    # frames within 85% of the best visibility, then choose the most compact
+    # nonempty SAM mask as the reference. A leaked table/board mask has a much
+    # larger area than a correctly isolated sleeve at comparable visibility.
+    maximum_margin = float(np.max(edge_margins))
+    reference_candidates = [
+        index
+        for index, margin in enumerate(edge_margins)
+        if margin >= 0.85 * maximum_margin
+        and 0.002 <= float(np.mean(masks[index])) <= 0.20
+    ]
+    if not reference_candidates:
+        reference_index = int(np.argmax(edge_margins))
+    else:
+        reference_index = min(
+            reference_candidates, key=lambda index: float(np.mean(masks[index]))
+        )
+    base, endpoint = axes[reference_index]
+    axis = endpoint - base
+    axis_length = float(np.linalg.norm(axis))
+    if axis_length < 1e-5:
+        raise RuntimeError("reference arm axis is degenerate")
+    unit = axis / axis_length
+    perpendicular = np.asarray([-unit[1], unit[0]], dtype=np.float32)
+    ys, xs = np.nonzero(masks[reference_index])
+    coordinates = np.stack([xs, ys], axis=1).astype(np.float32)
+    relative = coordinates - base[None]
+    longitudinal = relative @ unit / axis_length
+    lateral = np.abs(relative @ perpendicular)
+
+    radii = np.full(profile_bins, np.nan, dtype=np.float32)
+    edges = np.linspace(0.0, 1.0, profile_bins + 1)
+    for bin_index in range(profile_bins):
+        selected = (longitudinal >= edges[bin_index]) & (
+            longitudinal < edges[bin_index + 1]
+        )
+        if np.count_nonzero(selected) >= 24:
+            radii[bin_index] = float(np.percentile(lateral[selected], 92.0))
+    valid_bins = np.flatnonzero(np.isfinite(radii))
+    # A clean seed may show only the distal sleeve; requiring a mask all the
+    # way to the image border forces selection of the very leaked masks we are
+    # trying to reject. Three cross-sections are enough to estimate width, and
+    # np.interp deliberately extrapolates the nearest clean radius.
+    if len(valid_bins) < max(3, profile_bins // 4):
+        raise RuntimeError("reference SAM mask does not contain a measurable sleeve")
+    radii = np.interp(
+        np.arange(profile_bins), valid_bins, radii[valid_bins]
+    ).astype(np.float32)
+    radii = np.clip(radii + float(profile_margin), 28.0, 88.0)
+    radii = np.convolve(radii, np.asarray([0.25, 0.5, 0.25]), mode="same")
+    radii[0] = 0.75 * radii[0] + 0.25 * radii[1]
+    radii[-1] = 0.75 * radii[-1] + 0.25 * radii[-2]
+
+    reference_scale = hand_scales[reference_index]
+    envelopes: list[np.ndarray] = []
+    for frame_index, (frame_base, frame_endpoint) in enumerate(axes):
+        frame_axis = frame_endpoint - frame_base
+        scale = float(np.clip(hand_scales[frame_index] / reference_scale, 0.78, 1.28))
+        envelope = np.zeros((height, width), dtype=np.uint8)
+        for fraction in np.linspace(0.0, 1.0, profile_bins * 4):
+            profile_position = fraction * (profile_bins - 1)
+            lower = int(np.floor(profile_position))
+            upper = min(profile_bins - 1, lower + 1)
+            blend = profile_position - lower
+            radius = int(round(((1.0 - blend) * radii[lower] + blend * radii[upper]) * scale))
+            center = frame_base + float(fraction) * frame_axis
+            cv2.circle(
+                envelope,
+                tuple(np.rint(center).astype(np.int32)),
+                max(1, radius),
+                1,
+                -1,
+                cv2.LINE_AA,
+            )
+        hand_support = tracked_hand_support_mask(
+            hand_joints_camera_cv[frame_index],
+            intrinsic,
+            width,
+            height,
+            radius=max(8, int(round(min(width, height) * 0.04))),
+        )
+        envelopes.append((envelope > 0) | hand_support)
+    return envelopes, reference_index, radii
+
+
+def appearance_refine_arm_hand_masks(
+    raw_masks: list[np.ndarray] | tuple[np.ndarray, ...],
+    frames: list[np.ndarray] | tuple[np.ndarray, ...],
+    hand_joints_camera_cv: np.ndarray,
+    arm_joints_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    appearance_threshold: float = 3.0,
+    update_rate: float = 0.12,
+) -> tuple[list[np.ndarray], int, np.ndarray, np.ndarray]:
+    """Suppress SAM leakage using a temporally tracked sleeve appearance model.
+
+    A compact, high-visibility reference frame supplies robust LAB statistics
+    for sleeve pixels. The model is tracked independently forward and backward
+    in time, but it can only accept pixels inside the conservative geometric
+    arm envelope and the raw SAM mask. The hand is recovered separately with a
+    keypoint-skeleton support, so skin color need not resemble the sleeve.
+    """
+
+    masks = [np.asarray(mask, dtype=bool) for mask in raw_masks]
+    bgr_frames = [np.asarray(frame, dtype=np.uint8) for frame in frames]
+    count = len(masks)
+    if count == 0 or len(bgr_frames) != count:
+        raise ValueError("raw mask and frame sequences must be nonempty and aligned")
+    if not 0 < appearance_threshold:
+        raise ValueError("appearance_threshold must be positive")
+    if not 0 <= update_rate <= 1:
+        raise ValueError("update_rate must be in [0, 1]")
+
+    # Reuse the compact-reference selection validated by the width experiment.
+    _, reference_index, _ = adaptive_arm_hand_envelopes(
+        masks,
+        hand_joints_camera_cv,
+        arm_joints_camera_cv,
+        intrinsic,
+        width,
+        height,
+    )
+    broad_envelopes = [
+        arm_hand_geometry_envelope(
+            hand_joints_camera_cv[index],
+            arm_joints_camera_cv[index],
+            intrinsic,
+            width,
+            height,
+        )
+        for index in range(count)
+    ]
+    lab_frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2LAB) for frame in bgr_frames]
+
+    def hand_region(frame_index: int) -> np.ndarray:
+        return tracked_hand_support_mask(
+            hand_joints_camera_cv[frame_index],
+            intrinsic,
+            width,
+            height,
+            radius=max(8, int(round(min(width, height) * 0.04))),
+        )
+
+    reference_base, reference_endpoint = _arm_axis_for_frame(
+        hand_joints_camera_cv[reference_index],
+        arm_joints_camera_cv[reference_index],
+        intrinsic,
+        width,
+        height,
+    )
+    reference_axis = reference_endpoint - reference_base
+    reference_length = float(np.linalg.norm(reference_axis))
+    reference_unit = reference_axis / max(reference_length, 1e-5)
+    grid_y, grid_x = np.indices((height, width), dtype=np.float32)
+    relative_x = grid_x - reference_base[0]
+    relative_y = grid_y - reference_base[1]
+    longitudinal = (
+        relative_x * reference_unit[0] + relative_y * reference_unit[1]
+    ) / max(reference_length, 1e-5)
+    reference_hand_region = hand_region(reference_index)
+    reference_sleeve = masks[reference_index] & broad_envelopes[reference_index]
+    reference_sleeve &= ~reference_hand_region
+    # Prefer the clean distal sleeve seen in the compact reference. If too few
+    # pixels survive, relax the longitudinal gate but never include the hand.
+    distal = reference_sleeve & (longitudinal >= 0.02) & (longitudinal <= 0.55)
+    if np.count_nonzero(distal) >= 256:
+        reference_sleeve = distal
+    if np.count_nonzero(reference_sleeve) < 128:
+        raise RuntimeError("too few reference sleeve pixels for appearance tracking")
+    reference_colors = lab_frames[reference_index][reference_sleeve].astype(np.float32)
+    center = np.median(reference_colors, axis=0)
+    mad = np.median(np.abs(reference_colors - center[None]), axis=0)
+    scale = np.maximum(1.4826 * mad, np.asarray([10.0, 7.0, 7.0], np.float32))
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    refined: list[np.ndarray | None] = [None] * count
+
+    def process_frame(
+        frame_index: int, current_center: np.ndarray, current_scale: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        difference = (
+            lab_frames[frame_index].astype(np.float32) - current_center[None, None]
+        ) / current_scale[None, None]
+        appearance = np.sqrt(np.mean(difference * difference, axis=2))
+        sleeve_candidate = masks[frame_index] & broad_envelopes[frame_index]
+        sleeve_candidate &= appearance <= appearance_threshold
+        sleeve_candidate = cv2.morphologyEx(
+            sleeve_candidate.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel
+        )
+        sleeve_candidate = cv2.morphologyEx(
+            sleeve_candidate, cv2.MORPH_OPEN, open_kernel
+        ) > 0
+
+        # Keep appearance-consistent components connected to an image boundary
+        # or to the wrist neighborhood. Detached board islands are discarded.
+        base, _ = _arm_axis_for_frame(
+            hand_joints_camera_cv[frame_index],
+            arm_joints_camera_cv[frame_index],
+            intrinsic,
+            width,
+            height,
+        )
+        count_components, labels, stats, _ = cv2.connectedComponentsWithStats(
+            sleeve_candidate.astype(np.uint8), connectivity=8
+        )
+        sleeve = np.zeros((height, width), dtype=bool)
+        bx = int(np.clip(round(float(base[0])), 0, width - 1))
+        by = int(np.clip(round(float(base[1])), 0, height - 1))
+        wrist_radius = max(16, int(round(min(width, height) * 0.055)))
+        for component_id in range(1, count_components):
+            if int(stats[component_id, cv2.CC_STAT_AREA]) < 96:
+                continue
+            component = labels == component_id
+            touches_border = bool(
+                component[:5].any()
+                or component[-5:].any()
+                or component[:, :5].any()
+                or component[:, -5:].any()
+            )
+            y0, y1 = max(0, by - wrist_radius), min(height, by + wrist_radius + 1)
+            x0, x1 = max(0, bx - wrist_radius), min(width, bx + wrist_radius + 1)
+            touches_wrist = bool(component[y0:y1, x0:x1].any())
+            if touches_border or touches_wrist:
+                sleeve |= component
+
+        support = hand_region(frame_index)
+        hand = support
+        result = sleeve | hand
+        if np.count_nonzero(sleeve) >= 256:
+            colors = lab_frames[frame_index][sleeve].astype(np.float32)
+            observed_center = np.median(colors, axis=0)
+            observed_mad = np.median(
+                np.abs(colors - observed_center[None]), axis=0
+            )
+            observed_scale = np.maximum(
+                1.4826 * observed_mad,
+                np.asarray([10.0, 7.0, 7.0], np.float32),
+            )
+            current_center = (
+                (1.0 - update_rate) * current_center + update_rate * observed_center
+            )
+            current_scale = (
+                (1.0 - update_rate) * current_scale + update_rate * observed_scale
+            )
+        return result, current_center, current_scale
+
+    for indices in (
+        range(reference_index, count),
+        range(reference_index - 1, -1, -1),
+    ):
+        tracked_center = center.copy()
+        tracked_scale = scale.copy()
+        for frame_index in indices:
+            result, tracked_center, tracked_scale = process_frame(
+                frame_index, tracked_center, tracked_scale
+            )
+            refined[frame_index] = result
+    if any(mask is None for mask in refined):
+        raise RuntimeError("appearance refinement did not process every frame")
+    return [np.asarray(mask, dtype=bool) for mask in refined], reference_index, center, scale
+
+
 def _prompt_for_frame(
     joints_camera_cv: np.ndarray,
     intrinsic: np.ndarray,
@@ -798,7 +1263,20 @@ def segment_arm_hand_video(
             positive_seeds[frame_index] = np.concatenate(
                 [hand_points[hand_labels == 1], arm_points[arm_labels == 1]], axis=0
             )
-        clean_union = _clean_arm_hand_mask(union, positive_seeds[frame_index])
+        geometry_envelope = arm_hand_geometry_envelope(
+            hand_joints_camera_cv[frame_index],
+            arm_joints_camera_cv[frame_index],
+            intrinsic,
+            width,
+            height,
+        )
+        # PHANTOM hard-crops hand masks to tracked boxes. For a whole arm, an
+        # axis-aligned box is too destructive, so use an oriented per-frame
+        # wrist-to-elbow envelope instead. Apply it before component cleanup:
+        # otherwise any oversized SAM region touching the image border survives.
+        clean_union = _clean_arm_hand_mask(
+            union & geometry_envelope, positive_seeds[frame_index]
+        )
         if np.count_nonzero(clean_union) < 256:
             raise RuntimeError(f"SAM2 arm+hand mask too small at frame {frame_index}")
         clean_masks.append(clean_union)

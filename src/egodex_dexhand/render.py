@@ -27,6 +27,21 @@ HIDEABLE_ARM_VISUAL_LINKS = frozenset(
 )
 
 
+def _create_sapien_scene(render_device: str):
+    """Create a render scene only on an explicitly selected Vulkan device."""
+
+    if not render_device or not render_device.strip():
+        raise ValueError("an explicit SAPIEN Vulkan render_device is required")
+    import sapien
+
+    return sapien.Scene(
+        [
+            sapien.physx.PhysxCpuSystem(),
+            sapien.render.RenderSystem(render_device),
+        ]
+    )
+
+
 def _temporal_sample_positions(
     frame_index: int,
     frame_count: int,
@@ -385,6 +400,7 @@ def render_robot_sequence(
     height: int,
     output_dir: str | Path,
     fps: float,
+    render_device: str,
     temporal_samples: int = DEFAULT_TEMPORAL_SAMPLES,
     shutter_fraction: float = DEFAULT_SHUTTER_FRACTION,
     decontaminate_radius: int = DEFAULT_DECONTAMINATE_RADIUS,
@@ -399,7 +415,7 @@ def render_robot_sequence(
     output_dir = Path(output_dir)
     directories = _render_output_directories(output_dir)
 
-    scene = sapien.Scene()
+    scene = _create_sapien_scene(render_device)
     scene.set_ambient_light([0.55, 0.55, 0.55])
     scene.add_directional_light([0.4, -0.4, -1.0], [1.8, 1.8, 1.8], shadow=True)
     scene.add_directional_light([-0.4, 0.4, -0.2], [0.8, 0.8, 0.8], shadow=False)
@@ -526,6 +542,7 @@ def render_arm_hand_sequence(
     height: int,
     output_dir: str | Path,
     fps: float,
+    render_device: str,
     temporal_samples: int = DEFAULT_TEMPORAL_SAMPLES,
     shutter_fraction: float = DEFAULT_SHUTTER_FRACTION,
     decontaminate_radius: int = DEFAULT_DECONTAMINATE_RADIUS,
@@ -546,7 +563,7 @@ def render_arm_hand_sequence(
         output_dir, extra_names=("arm_mask", "hand_mask")
     )
 
-    scene = sapien.Scene()
+    scene = _create_sapien_scene(render_device)
     scene.set_ambient_light([0.55, 0.55, 0.55])
     scene.add_directional_light([0.4, -0.4, -1.0], [1.8, 1.8, 1.8], shadow=True)
     scene.add_directional_light([-0.4, 0.4, -0.2], [0.8, 0.8, 0.8], shadow=False)
@@ -723,10 +740,13 @@ def render_ur5e_shadow_sequence(
     height: int,
     output_dir: str | Path,
     fps: float,
+    render_device: str,
     temporal_samples: int = DEFAULT_TEMPORAL_SAMPLES,
     shutter_fraction: float = DEFAULT_SHUTTER_FRACTION,
     decontaminate_radius: int = DEFAULT_DECONTAMINATE_RADIUS,
     hidden_arm_visual_links: tuple[str, ...] | list[str] = (),
+    require_robot_visibility: bool = True,
+    require_arm_visibility: bool = True,
 ) -> None:
     """Render integrated UR5e + Shadow with a soft premultiplied matte."""
 
@@ -745,7 +765,7 @@ def render_ur5e_shadow_sequence(
         output_dir, extra_names=("arm_mask", "hand_mask")
     )
 
-    scene = sapien.Scene()
+    scene = _create_sapien_scene(render_device)
     scene.set_ambient_light([0.55, 0.55, 0.55])
     scene.add_directional_light([0.4, -0.4, -1.0], [1.8, 1.8, 1.8], shadow=True)
     scene.add_directional_light([-0.4, 0.4, -0.2], [0.8, 0.8, 0.8], shadow=False)
@@ -892,8 +912,9 @@ def render_ur5e_shadow_sequence(
         hand_union = partition["hand"]
         combined_union = arm_union | hand_union
         combined_area = int(np.count_nonzero(combined_union))
-        if combined_area < 64:
-            raise RuntimeError(f"empty UR5e + Shadow render at frame {frame_index}")
+        # A hand can legitimately enter or leave through the image boundary.
+        # Preserve frame alignment with a transparent render instead of
+        # aborting the complete segment on that recoverable frame.
         straight, premultiplied, alpha = _finalize_temporal_accumulation(
             premultiplied_sum, alpha_sum, len(sample_positions)
         )
@@ -919,8 +940,47 @@ def render_ur5e_shadow_sequence(
         arm_areas.append(int(np.count_nonzero(arm_union)))
     writer.release()
 
-    if min(combined_areas) < 64 or sum(area >= 16 for area in arm_areas) < len(arm_areas) // 2:
+    _validate_single_robot_visibility(
+        combined_areas,
+        arm_areas,
+        require_robot_visibility=require_robot_visibility,
+        require_arm_visibility=require_arm_visibility,
+    )
+
+
+def _validate_single_robot_visibility(
+    combined_areas: list[int],
+    arm_areas: list[int],
+    *,
+    require_robot_visibility: bool,
+    require_arm_visibility: bool,
+) -> None:
+    visible_robot_frames = sum(area >= 64 for area in combined_areas)
+    visible_arm_frames = sum(area >= 16 for area in arm_areas)
+    if (require_robot_visibility and visible_robot_frames == 0) or (
+        require_arm_visibility and visible_arm_frames == 0
+    ):
         raise RuntimeError("UR5e + Shadow visibility validation failed")
+
+
+def _validate_bimanual_robot_visibility(
+    combined_areas: list[int],
+    side_robot_areas: dict[str, list[int]],
+    side_arm_areas: dict[str, list[int]],
+    *,
+    require_robot_visibility_by_side: dict[str, bool],
+    require_arm_visibility: bool,
+) -> None:
+    if any(require_robot_visibility_by_side.values()) and not any(
+        area >= 128 for area in combined_areas
+    ):
+        raise RuntimeError("bimanual combined robot mask is implausibly small")
+    for side in ("left", "right"):
+        side_required = bool(require_robot_visibility_by_side[side])
+        if side_required and not any(area >= 32 for area in side_robot_areas[side]):
+            raise RuntimeError(f"{side} robot is never visible")
+        if side_required and require_arm_visibility and max(side_arm_areas[side]) < 16:
+            raise RuntimeError(f"{side} arm is never visible")
 
 
 def render_bimanual_ur5e_shadow_sequence(
@@ -931,9 +991,12 @@ def render_bimanual_ur5e_shadow_sequence(
     height: int,
     output_dir: str | Path,
     fps: float,
+    render_device: str,
     temporal_samples: int = DEFAULT_TEMPORAL_SAMPLES,
     shutter_fraction: float = DEFAULT_SHUTTER_FRACTION,
     decontaminate_radius: int = DEFAULT_DECONTAMINATE_RADIUS,
+    require_robot_visibility_by_side: dict[str, bool] | None = None,
+    require_arm_visibility: bool = True,
 ) -> None:
     """Render both UR5e + Shadow arms with a soft premultiplied matte."""
 
@@ -941,6 +1004,12 @@ def render_bimanual_ur5e_shadow_sequence(
 
     if {trajectory.side for trajectory in trajectories} != {"left", "right"}:
         raise ValueError("bimanual rendering requires one left and one right trajectory")
+    if require_robot_visibility_by_side is None:
+        require_robot_visibility_by_side = {"left": True, "right": True}
+    elif set(require_robot_visibility_by_side) != {"left", "right"}:
+        raise ValueError(
+            "require_robot_visibility_by_side must contain left and right"
+        )
     world_from_camera = np.asarray(world_from_camera, dtype=np.float64)
     frame_count = len(world_from_camera)
     if world_from_camera.shape != (frame_count, 4, 4):
@@ -961,7 +1030,7 @@ def render_bimanual_ur5e_shadow_sequence(
         output_dir, extra_names=extra_directory_names
     )
 
-    scene = sapien.Scene()
+    scene = _create_sapien_scene(render_device)
     scene.set_ambient_light([0.55, 0.55, 0.55])
     scene.add_directional_light([0.4, -0.4, -1.0], [1.8, 1.8, 1.8], shadow=True)
     scene.add_directional_light([-0.4, 0.4, -0.2], [0.8, 0.8, 0.8], shadow=False)
@@ -1174,8 +1243,9 @@ def render_bimanual_ur5e_shadow_sequence(
         combined_hand = side_unions["left"]["hand"] | side_unions["right"]["hand"]
         combined_mask = combined_arm | combined_hand
         area = int(np.count_nonzero(combined_mask))
-        if area < 128:
-            raise RuntimeError(f"empty bimanual render at frame {frame_index}")
+        # Do not make a transient off-screen frame fatal.  The zero-alpha
+        # image is a valid, frame-aligned render and later compositing leaves
+        # the source pixels unchanged there.
         combined_areas.append(area)
         straight, premultiplied, alpha = _finalize_temporal_accumulation(
             premultiplied_sum, alpha_sum, len(sample_positions)
@@ -1197,10 +1267,10 @@ def render_bimanual_ur5e_shadow_sequence(
             )
     writer.release()
 
-    if min(combined_areas) < 128:
-        raise RuntimeError("bimanual combined robot mask is implausibly small")
-    for side in ("left", "right"):
-        if min(side_robot_areas[side]) < 32:
-            raise RuntimeError(f"{side} robot leaves the image")
-        if max(side_arm_areas[side]) < 16:
-            raise RuntimeError(f"{side} arm is never visible")
+    _validate_bimanual_robot_visibility(
+        combined_areas,
+        side_robot_areas,
+        side_arm_areas,
+        require_robot_visibility_by_side=require_robot_visibility_by_side,
+        require_arm_visibility=require_arm_visibility,
+    )

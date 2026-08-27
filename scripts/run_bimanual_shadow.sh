@@ -44,7 +44,7 @@ while [[ ${index} -lt ${#EXTRA_ARGS[@]} ]]; do
         [[ ${index} -lt ${#EXTRA_ARGS[@]} ]] || { echo "missing ${argument} values" >&2; exit 2; }
       done
       ;;
-    --left-hide-arm-visual-link|--right-hide-arm-visual-link)
+    --left-hide-arm-visual-link|--right-hide-arm-visual-link|--render-device)
       index=$((index + 1))
       [[ ${index} -lt ${#EXTRA_ARGS[@]} ]] || { echo "missing ${argument} value" >&2; exit 2; }
       ;;

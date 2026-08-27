@@ -12,6 +12,8 @@ from egodex_dexhand.compose import (
 )
 from egodex_dexhand.data import fuse_hand_visibility, projected_hand_visibility
 from egodex_dexhand.render import (
+    _validate_bimanual_robot_visibility,
+    _validate_single_robot_visibility,
     DEFAULT_TEMPORAL_SAMPLES,
     _decontaminate_foreground,
     _finalize_temporal_accumulation,
@@ -21,6 +23,34 @@ from egodex_dexhand.render import (
     _partition_temporal_masks,
     _temporal_sample_positions,
 )
+
+
+class RobotVisibilityValidationTests(unittest.TestCase):
+    def test_rgb_only_bimanual_side_can_remain_transparent(self) -> None:
+        _validate_bimanual_robot_visibility(
+            [200],
+            {"left": [200], "right": [0]},
+            {"left": [0], "right": [0]},
+            require_robot_visibility_by_side={"left": True, "right": False},
+            require_arm_visibility=False,
+        )
+
+    def test_projected_bimanual_side_must_render(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "right robot"):
+            _validate_bimanual_robot_visibility(
+                [200],
+                {"left": [200], "right": [0]},
+                {"left": [0], "right": [0]},
+                require_robot_visibility_by_side={"left": True, "right": True},
+                require_arm_visibility=False,
+            )
+
+    def test_rgb_only_single_side_can_remain_transparent(self) -> None:
+        _validate_single_robot_visibility(
+            [0], [0],
+            require_robot_visibility=False,
+            require_arm_visibility=False,
+        )
 
 
 class MotionAwareRenderTests(unittest.TestCase):

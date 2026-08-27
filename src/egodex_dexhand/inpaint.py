@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,45 @@ import numpy as np
 
 DEFAULT_MASK_DILATION = 10
 DEFAULT_SEAM_FEATHER = 4
+
+
+def propainter_environment() -> dict[str, str]:
+    """Put ProPainter on the least-loaded physical CUDA device.
+
+    SAPIEN workers intentionally expose one GPU through CUDA_VISIBLE_DEVICES,
+    but inpainting is an independent subprocess and can safely use another
+    device. This prevents unrelated jobs on the render GPU from turning a
+    completed retarget/render into a falsely "unrenderable" chunk.
+    """
+
+    environment = dict(os.environ)
+    requested = environment.get("EGODEX_INPAINT_CUDA_VISIBLE_DEVICES")
+    if requested:
+        environment["CUDA_VISIBLE_DEVICES"] = requested
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            candidates = []
+            for line in result.stdout.splitlines():
+                index, free_memory = (int(value.strip()) for value in line.split(","))
+                candidates.append((free_memory, index))
+            if candidates:
+                environment["CUDA_VISIBLE_DEVICES"] = str(max(candidates)[1])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # CPU-only tests and single-GPU hosts retain their supplied device.
+            pass
+    environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    return environment
 
 
 def soft_inpaint_alpha(
@@ -32,14 +72,17 @@ def soft_inpaint_alpha(
     binary = np.asarray(mask) > 0
     if binary.ndim != 2:
         raise ValueError(f"mask must be 2-D, got {binary.shape}")
-    if not binary.any():
-        raise ValueError("mask has no foreground")
     mask_dilation = int(mask_dilation)
     seam_feather = int(seam_feather)
     if mask_dilation < 0:
         raise ValueError("mask_dilation must be non-negative")
     if not 0 <= seam_feather <= mask_dilation:
         raise ValueError("seam_feather must be between 0 and mask_dilation")
+    if not binary.any():
+        # Visibility padding and per-side fusion can legitimately produce an
+        # empty union mask. ProPainter leaves that frame untouched, so the
+        # exact seam-blending counterpart is a zero-alpha matte.
+        return np.zeros(binary.shape, dtype=np.float32)
 
     # scipy.ndimage.binary_dilation, used by ProPainter, applies one-connected
     # pixel iteration at a time.  A 3x3 cross reproduces that footprint.
@@ -98,6 +141,46 @@ def run_propainter(
 ) -> Path:
     """Run ProPainter and return a seam-blended, exact-resolution video."""
 
+    command = propainter_command(
+        frames_dir=frames_dir,
+        masks_dir=masks_dir,
+        propainter_root=propainter_root,
+        output_dir=output_dir,
+        python_executable=python_executable,
+        fps=fps,
+        fp16=fp16,
+        mask_dilation=mask_dilation,
+        seam_feather=seam_feather,
+    )
+    subprocess.run(
+        command,
+        cwd=Path(propainter_root).resolve(),
+        check=True,
+        env=propainter_environment(),
+    )
+    return finalize_propainter_output(
+        frames_dir=frames_dir,
+        masks_dir=masks_dir,
+        output_dir=output_dir,
+        fps=fps,
+        mask_dilation=mask_dilation,
+        seam_feather=seam_feather,
+    )
+
+
+def propainter_command(
+    frames_dir: str | Path,
+    masks_dir: str | Path,
+    propainter_root: str | Path,
+    output_dir: str | Path,
+    python_executable: str,
+    fps: float,
+    fp16: bool = True,
+    mask_dilation: int = DEFAULT_MASK_DILATION,
+    seam_feather: int = DEFAULT_SEAM_FEATHER,
+) -> list[str]:
+    """Build the exact upstream ProPainter invocation used by the pipeline."""
+
     frames_dir = Path(frames_dir).resolve()
     masks_dir = Path(masks_dir).resolve()
     propainter_root = Path(propainter_root).resolve()
@@ -139,7 +222,26 @@ def run_propainter(
     ]
     if fp16:
         command.append("--fp16")
-    subprocess.run(command, cwd=propainter_root, check=True)
+    return command
+
+
+def finalize_propainter_output(
+    frames_dir: str | Path,
+    masks_dir: str | Path,
+    output_dir: str | Path,
+    fps: float,
+    mask_dilation: int = DEFAULT_MASK_DILATION,
+    seam_feather: int = DEFAULT_SEAM_FEATHER,
+) -> Path:
+    """Validate and seam-blend an already generated ProPainter result."""
+
+    frames_dir = Path(frames_dir).resolve()
+    masks_dir = Path(masks_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    if int(mask_dilation) < 0:
+        raise ValueError("mask_dilation must be non-negative")
+    if not 0 <= int(seam_feather) <= int(mask_dilation):
+        raise ValueError("seam_feather must be between 0 and mask_dilation")
 
     # With a frame directory input, ProPainter names the result after that dir.
     result_root = output_dir / frames_dir.name
