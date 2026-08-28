@@ -146,15 +146,26 @@ def verify_run(run_dir: str | Path) -> dict[str, object]:
                 or float(np.max(orientation_error)) > 5.0
             ):
                 raise RuntimeError(f"invalid or excessive {side} arm IK residual")
+            static_base = (
+                base_translation.shape == (3,) and base_rotation.shape == (3, 3)
+            )
+            dynamic_base = (
+                base_translation.shape == (expected, 3)
+                and base_rotation.shape == (expected, 3, 3)
+            )
+            rotation_products = (
+                np.einsum("...ji,...jk->...ik", base_rotation, base_rotation)
+                if static_base or dynamic_base
+                else np.empty((0, 3, 3))
+            )
             if (
-                base_translation.shape != (3,)
-                or base_rotation.shape != (3, 3)
+                not (static_base or dynamic_base)
                 or camera_poses.shape != (expected, 4, 4)
                 or not np.isfinite(base_translation).all()
                 or not np.isfinite(base_rotation).all()
                 or not np.isfinite(camera_poses).all()
-                or not np.allclose(base_rotation.T @ base_rotation, np.eye(3), atol=1e-4)
-                or not np.isclose(np.linalg.det(base_rotation), 1.0, atol=1e-4)
+                or not np.allclose(rotation_products, np.eye(3), atol=1e-4)
+                or not np.allclose(np.linalg.det(base_rotation), 1.0, atol=1e-4)
             ):
                 raise RuntimeError(f"invalid {side} arm base or camera transforms")
             derived_urdf = Path(str(arm_data["urdf_path"].item()))
@@ -165,6 +176,7 @@ def verify_run(run_dir: str | Path) -> dict[str, object]:
                 "qpos_shape": list(arm_qpos.shape),
                 "qpos_finite": True,
                 "qpos_within_recorded_limits": True,
+                "base_mode": "camera_relative" if dynamic_base else "world_fixed",
                 "position_error_mm": {
                     "median": float(np.median(position_error) * 1000.0),
                     "max": float(np.max(position_error) * 1000.0),
@@ -179,6 +191,12 @@ def verify_run(run_dir: str | Path) -> dict[str, object]:
                 },
                 "target_adjusted_frames": [
                     int(value) for value in arm_data["target_adjusted_frames"]
+                ],
+                "base_corrected_frames": [
+                    int(value)
+                    for value in arm_data.get(
+                        "base_corrected_frames", np.asarray([], dtype=np.int64)
+                    )
                 ],
                 "derived_urdf": str(derived_urdf),
             }

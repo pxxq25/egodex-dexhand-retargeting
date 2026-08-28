@@ -179,6 +179,7 @@ class VulkanDeviceTests(unittest.TestCase):
 
         index = command.index("--render-device")
         self.assertEqual(command[index + 1], "cuda:6")
+        self.assertIn("--camera-relative-base", command)
 
     def test_preflight_retries_after_timeout(self) -> None:
         with mock.patch.object(

@@ -18,6 +18,8 @@ UR5E_JOINT_NAMES = (
     "wrist_2_joint",
     "wrist_3_joint",
 )
+CAMERA_RELATIVE_BASE_REACH_MARGIN = 0.12
+CAMERA_RELATIVE_BASE_RAMP_FRAMES = 12
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class UR5eArmResult:
     position_error: np.ndarray
     orientation_error_degrees: np.ndarray
     target_adjusted_frames: np.ndarray
+    base_corrected_frames: np.ndarray
     urdf_path: Path
 
 
@@ -150,6 +153,7 @@ def solve_ur5e_arm_sequence(
     initial_qpos: np.ndarray | None = None,
     base_translation_world: np.ndarray | None = None,
     base_rotation_world: np.ndarray | None = None,
+    camera_relative_base: bool = False,
 ) -> UR5eArmResult:
     """Solve UR5e IK so its mounted Shadow forearm matches retargeting exactly."""
 
@@ -226,10 +230,99 @@ def solve_ur5e_arm_sequence(
             np.asarray(pose.rotation, dtype=np.float64).copy(),
         )
 
-    # Anchor the model at the middle of the clip.  This reference posture keeps
-    # the UR5e base and proximal links offscreen while its distal links enter
-    # through the same lower-right border as the captured human sleeve.
-    if base_translation_world is None:
+    # For an egocentric camera, the embodiment base moves with the camera/body.
+    # Keeping it fixed in room coordinates makes a walking wearer move the hand
+    # target metres beyond the UR5e workspace.  Establish one camera-to-base
+    # transform, then carry it through the measured camera trajectory.
+    if camera_relative_base:
+        anchor = 0 if initial_qpos is not None else (frame_count - 1) // 2
+        base_reference_qpos = (
+            q_reference if initial_qpos is None else initial_qpos
+        )
+        position_base_reference, rotation_base_reference = forearm_pose(
+            base_reference_qpos
+        )
+        anchor_base_rotation_world = (
+            rotations_world[anchor] @ rotation_base_reference.T
+        )
+        anchor_base_translation_world = (
+            positions_world[anchor]
+            - anchor_base_rotation_world @ position_base_reference
+        )
+        # The exact reference placement can put the arm near full extension
+        # later in the interval.  Move the hidden proximal base toward the
+        # target to reserve workspace for subsequent hand motion; the visible
+        # Shadow forearm pose remains constrained by IK.
+        reference_distance = float(np.linalg.norm(position_base_reference))
+        reach_shift_base = np.zeros(3, dtype=np.float64)
+        if reference_distance > CAMERA_RELATIVE_BASE_REACH_MARGIN:
+            reach_shift_base = (
+                position_base_reference
+                / reference_distance
+                * CAMERA_RELATIVE_BASE_REACH_MARGIN
+            )
+        if (
+            initial_qpos is None
+            and reference_distance > CAMERA_RELATIVE_BASE_REACH_MARGIN
+        ):
+            anchor_base_translation_world += (
+                anchor_base_rotation_world @ reach_shift_base
+            )
+        anchor_camera = world_from_camera[anchor]
+        camera_rotation_from_base = (
+            anchor_camera[:3, :3].T @ anchor_base_rotation_world
+        )
+        camera_translation_from_base = (
+            anchor_camera[:3, :3].T
+            @ (anchor_base_translation_world - anchor_camera[:3, 3])
+        )
+        base_rotation_world = np.einsum(
+            "tij,jk->tik",
+            world_from_camera[:, :3, :3],
+            camera_rotation_from_base,
+        )
+        # Follow the tracked upper-arm/shoulder marker in translation.  A base
+        # rigidly fixed to the head camera still sees the shoulder move by up
+        # to half a metre during walking and leaning, which can drive the UR5e
+        # through full extension.  Preserve the anchor's base-to-shoulder
+        # offset in camera axes so the robot remains body-mounted while its
+        # orientation stays camera-relative.  Fall back to a rigid camera
+        # mount only if the shoulder trajectory is unavailable.
+        shoulder_world = human_arm_joints_world[:, 1]
+        if np.isfinite(shoulder_world).all():
+            camera_translation_from_shoulder_to_base = (
+                anchor_camera[:3, :3].T
+                @ (anchor_base_translation_world - shoulder_world[anchor])
+            )
+            base_translation_world = shoulder_world + np.einsum(
+                "tij,j->ti",
+                world_from_camera[:, :3, :3],
+                camera_translation_from_shoulder_to_base,
+            )
+        else:
+            base_translation_world = (
+                np.einsum(
+                    "tij,j->ti",
+                    world_from_camera[:, :3, :3],
+                    camera_translation_from_base,
+                )
+                + world_from_camera[:, :3, 3]
+            )
+        if initial_qpos is not None:
+            # At a chunk boundary, frame zero must retain the previous joint
+            # state exactly.  Introduce the reach reserve over the overlap
+            # margin instead of shifting the base abruptly at the boundary.
+            ramp = np.clip(
+                np.arange(frame_count, dtype=np.float64)
+                / float(CAMERA_RELATIVE_BASE_RAMP_FRAMES),
+                0.0,
+                1.0,
+            )
+            base_translation_world += ramp[:, None] * np.einsum(
+                "tij,j->ti", base_rotation_world, reach_shift_base
+            )
+    # Legacy room-fixed mode remains available for non-egocentric callers.
+    elif base_translation_world is None:
         anchor = (frame_count - 1) // 2
         position_base_reference, rotation_base_reference = forearm_pose(q_reference)
         base_rotation_world = rotations_world[anchor] @ rotation_base_reference.T
@@ -255,16 +348,28 @@ def solve_ur5e_arm_sequence(
         ):
             raise ValueError("persisted UR5e base pose must be finite")
 
-    positions_base = (
-        base_rotation_world.T
-        @ (positions_world - base_translation_world).T
-    ).T
-    rotations_base = np.einsum(
-        "ij,tjk->tik", base_rotation_world.T, rotations_world
-    )
+    if camera_relative_base:
+        positions_base = np.einsum(
+            "tji,tj->ti",
+            base_rotation_world,
+            positions_world - base_translation_world,
+        )
+        rotations_base = np.einsum(
+            "tji,tjk->tik", base_rotation_world, rotations_world
+        )
+    else:
+        positions_base = (
+            base_rotation_world.T
+            @ (positions_world - base_translation_world).T
+        ).T
+        rotations_base = np.einsum(
+            "ij,tjk->tik", base_rotation_world.T, rotations_world
+        )
 
     q_frames = np.empty((frame_count, 6), dtype=np.float64)
-    q_frames[anchor] = q_reference
+    q_frames[anchor] = (
+        q_reference if initial_qpos is None else initial_qpos
+    )
 
     def solve_frame(frame_index: int, previous: np.ndarray) -> np.ndarray:
         def residual(qpos: np.ndarray) -> np.ndarray:
@@ -298,7 +403,9 @@ def solve_ur5e_arm_sequence(
         delta = np.arctan2(np.sin(candidate - previous), np.cos(candidate - previous))
         return float(np.linalg.norm(delta))
 
-    if initial_qpos is not None:
+    if camera_relative_base:
+        q_frames[anchor] = solve_frame(anchor, q_frames[anchor])
+    elif initial_qpos is not None:
         # Evaluate the persisted branch and the configured fallback, then keep
         # the feasible solution nearest to the prior state on the angle torus.
         candidates = [solve_frame(anchor, initial_qpos)]
@@ -317,18 +424,68 @@ def solve_ur5e_arm_sequence(
         q_frames[frame_index] = solve_frame(frame_index, previous)
         previous = q_frames[frame_index]
 
+    # A six-joint arm can encounter a transient singularity even when the
+    # tracked forearm pose itself is valid.  In camera-relative mode the
+    # proximal UR5e links are intentionally hidden, so correct only those
+    # residual frames by moving the hidden root.  The visible Shadow forearm
+    # and hand remain exactly on the measured target while arm qpos stays on
+    # its continuous branch.
+    base_corrected_frames: list[int] = []
+    if camera_relative_base:
+        for frame_index, qpos in enumerate(q_frames):
+            position, rotation = forearm_pose(qpos)
+            predicted_position_world = (
+                base_rotation_world[frame_index] @ position
+                + base_translation_world[frame_index]
+            )
+            predicted_rotation_world = base_rotation_world[frame_index] @ rotation
+            position_error = float(
+                np.linalg.norm(predicted_position_world - positions_world[frame_index])
+            )
+            orientation_error = float(
+                np.linalg.norm(
+                    Rotation.from_matrix(
+                        rotations_world[frame_index].T @ predicted_rotation_world
+                    ).as_rotvec()
+                )
+                * 180.0
+                / np.pi
+            )
+            if position_error > 0.005 or orientation_error > 3.0:
+                corrected_rotation = rotations_world[frame_index] @ rotation.T
+                base_rotation_world[frame_index] = corrected_rotation
+                base_translation_world[frame_index] = (
+                    positions_world[frame_index] - corrected_rotation @ position
+                )
+                base_corrected_frames.append(frame_index)
+
     position_errors = []
     orientation_errors = []
     for frame_index, qpos in enumerate(q_frames):
         position, rotation = forearm_pose(qpos)
+        predicted_position_world = (
+            base_rotation_world[frame_index] @ position
+            + base_translation_world[frame_index]
+            if camera_relative_base
+            else base_rotation_world @ position + base_translation_world
+        )
+        predicted_rotation_world = (
+            base_rotation_world[frame_index] @ rotation
+            if camera_relative_base
+            else base_rotation_world @ rotation
+        )
         position_errors.append(
-            float(np.linalg.norm(position - positions_base[frame_index]))
+            float(
+                np.linalg.norm(
+                    predicted_position_world - positions_world[frame_index]
+                )
+            )
         )
         orientation_errors.append(
             float(
                 np.linalg.norm(
                     Rotation.from_matrix(
-                        rotations_base[frame_index].T @ rotation
+                        rotations_world[frame_index].T @ predicted_rotation_world
                     ).as_rotvec()
                 )
                 * 180.0
@@ -346,6 +503,7 @@ def solve_ur5e_arm_sequence(
         position_error=np.asarray(position_errors, dtype=np.float32),
         orientation_error_degrees=np.asarray(orientation_errors, dtype=np.float32),
         target_adjusted_frames=np.asarray(adjusted_frames, dtype=np.int64),
+        base_corrected_frames=np.asarray(base_corrected_frames, dtype=np.int64),
         urdf_path=combined_urdf,
     )
 
@@ -364,5 +522,6 @@ def save_ur5e_arm_result(path: str | Path, result: UR5eArmResult) -> None:
         position_error=result.position_error,
         orientation_error_degrees=result.orientation_error_degrees,
         target_adjusted_frames=result.target_adjusted_frames,
+        base_corrected_frames=result.base_corrected_frames,
         urdf_path=np.asarray(str(result.urdf_path)),
     )

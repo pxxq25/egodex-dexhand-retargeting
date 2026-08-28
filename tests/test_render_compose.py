@@ -12,6 +12,7 @@ from egodex_dexhand.compose import (
 )
 from egodex_dexhand.data import fuse_hand_visibility, projected_hand_visibility
 from egodex_dexhand.render import (
+    _base_transform_trajectory,
     _validate_bimanual_robot_visibility,
     _validate_single_robot_visibility,
     DEFAULT_TEMPORAL_SAMPLES,
@@ -54,6 +55,21 @@ class RobotVisibilityValidationTests(unittest.TestCase):
 
 
 class MotionAwareRenderTests(unittest.TestCase):
+    def test_robot_base_accepts_static_and_per_frame_poses(self) -> None:
+        static = _base_transform_trajectory(
+            np.asarray([1.0, 2.0, 3.0]), np.eye(3), 2
+        )
+        self.assertEqual(static.shape, (2, 4, 4))
+        np.testing.assert_allclose(static[:, :3, 3], [[1, 2, 3], [1, 2, 3]])
+
+        translation = np.asarray([[0.0, 0.0, 0.0], [2.0, 4.0, 6.0]])
+        rotation = np.repeat(np.eye(3)[None], 2, axis=0)
+        dynamic = _base_transform_trajectory(translation, rotation, 2)
+        np.testing.assert_allclose(dynamic[:, :3, 3], translation)
+
+        with self.assertRaisesRegex(ValueError, "robot base"):
+            _base_transform_trajectory(translation[:1], rotation, 2)
+
     def test_only_configured_arm_visuals_can_be_hidden(self) -> None:
         self.assertEqual(
             _normalize_hidden_arm_visual_links(

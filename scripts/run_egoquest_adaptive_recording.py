@@ -523,6 +523,10 @@ def common_flags(
         "--smoothing-window", "9",
         "--smoothing-passes", "2",
         "--forearm-max-angular-velocity", "2.0",
+        # The wearer can translate through the room.  Keep the embodiment base
+        # rigidly attached to the egocentric camera/body frame instead of
+        # leaving it behind at the first chunk's world position.
+        "--camera-relative-base",
     ]
     stop_stage = os.environ.get("EGODEX_BASELINE_STOP_STAGE")
     if stop_stage:

@@ -114,6 +114,37 @@ def _interpolate_rigid_transform(
     return result
 
 
+def _base_transform_trajectory(
+    base_translation_world: np.ndarray,
+    base_rotation_world: np.ndarray,
+    frame_count: int,
+) -> np.ndarray:
+    """Normalize a static or per-frame robot base pose to ``[T, 4, 4]``."""
+
+    translation = np.asarray(base_translation_world, dtype=np.float64)
+    rotation = np.asarray(base_rotation_world, dtype=np.float64)
+    if translation.shape == (3,) and rotation.shape == (3, 3):
+        translation = np.repeat(translation[None], frame_count, axis=0)
+        rotation = np.repeat(rotation[None], frame_count, axis=0)
+    elif translation.shape != (frame_count, 3) or rotation.shape != (
+        frame_count,
+        3,
+        3,
+    ):
+        raise ValueError(
+            "robot base must be a static ([3], [3,3]) pose or matching "
+            f"per-frame ([T,3], [T,3,3]) poses; got {translation.shape}, "
+            f"{rotation.shape} for T={frame_count}"
+        )
+    if not np.isfinite(translation).all() or not np.isfinite(rotation).all():
+        raise ValueError("robot base trajectory must be finite")
+
+    transforms = np.repeat(np.eye(4, dtype=np.float64)[None], frame_count, axis=0)
+    transforms[:, :3, :3] = rotation
+    transforms[:, :3, 3] = translation
+    return transforms
+
+
 def _decontaminate_foreground(
     rgb: np.ndarray, mask: np.ndarray, radius: int = DEFAULT_DECONTAMINATE_RADIUS
 ) -> np.ndarray:
@@ -557,6 +588,9 @@ def render_arm_hand_sequence(
     world_from_camera = np.asarray(world_from_camera, dtype=np.float64)
     if len(hand_qpos) != len(arm_qpos) or len(arm_qpos) != len(world_from_camera):
         raise ValueError("hand, arm, and camera trajectories must have equal length")
+    base_world = _base_transform_trajectory(
+        base_translation_world, base_rotation_world, len(arm_qpos)
+    )
 
     output_dir = Path(output_dir)
     directories = _render_output_directories(
@@ -647,10 +681,15 @@ def render_arm_hand_sequence(
                 sample_world_from_camera = _interpolate_rigid_transform(
                     world_from_camera, sample_position
                 )
+                sample_base_world = _interpolate_rigid_transform(
+                    base_world, sample_position
+                )
                 camera_from_world = np.linalg.inv(sample_world_from_camera)
-                rotation_cv = camera_from_world[:3, :3] @ base_rotation_world
+                rotation_cv = (
+                    camera_from_world[:3, :3] @ sample_base_world[:3, :3]
+                )
                 translation_cv = (
-                    camera_from_world[:3, :3] @ base_translation_world
+                    camera_from_world[:3, :3] @ sample_base_world[:3, 3]
                     + camera_from_world[:3, 3]
                 )
                 arm.set_root_pose(
@@ -759,6 +798,9 @@ def render_ur5e_shadow_sequence(
     base_rotation_world = np.asarray(base_rotation_world, dtype=np.float64)
     if len(arm_qpos) != len(hand_qpos) or len(arm_qpos) != len(world_from_camera):
         raise ValueError("arm, hand, and camera trajectories must have equal length")
+    base_world = _base_transform_trajectory(
+        base_translation_world, base_rotation_world, len(arm_qpos)
+    )
 
     output_dir = Path(output_dir)
     directories = _render_output_directories(
@@ -863,10 +905,15 @@ def render_ur5e_shadow_sequence(
             sample_world_from_camera = _interpolate_rigid_transform(
                 world_from_camera, sample_position
             )
+            sample_base_world = _interpolate_rigid_transform(
+                base_world, sample_position
+            )
             camera_from_world = np.linalg.inv(sample_world_from_camera)
-            rotation_cv = camera_from_world[:3, :3] @ base_rotation_world
+            rotation_cv = (
+                camera_from_world[:3, :3] @ sample_base_world[:3, :3]
+            )
             translation_cv = (
-                camera_from_world[:3, :3] @ base_translation_world
+                camera_from_world[:3, :3] @ sample_base_world[:3, 3]
                 + camera_from_world[:3, 3]
             )
             robot.set_root_pose(
@@ -1108,11 +1155,10 @@ def render_bimanual_ur5e_shadow_sequence(
             "sources": sources,
             "arm_qpos": arm_qpos,
             "hand_qpos": hand_qpos,
-            "base_translation": np.asarray(
-                trajectory.base_translation_world, dtype=np.float64
-            ),
-            "base_rotation": np.asarray(
-                trajectory.base_rotation_world, dtype=np.float64
+            "base_world": _base_transform_trajectory(
+                trajectory.base_translation_world,
+                trajectory.base_rotation_world,
+                frame_count,
             ),
             "arm_actor_ids": arm_actor_ids,
             "hand_actor_ids": hand_actor_ids,
@@ -1161,11 +1207,14 @@ def render_bimanual_ur5e_shadow_sequence(
             )
             camera_from_world = np.linalg.inv(sample_world_from_camera)
             for state in states.values():
-                base_rotation = state["base_rotation"]
-                base_translation = state["base_translation"]
-                rotation_cv = camera_from_world[:3, :3] @ base_rotation
+                sample_base_world = _interpolate_rigid_transform(
+                    state["base_world"], sample_position
+                )
+                rotation_cv = (
+                    camera_from_world[:3, :3] @ sample_base_world[:3, :3]
+                )
                 translation_cv = (
-                    camera_from_world[:3, :3] @ base_translation
+                    camera_from_world[:3, :3] @ sample_base_world[:3, 3]
                     + camera_from_world[:3, 3]
                 )
                 robot = state["robot"]

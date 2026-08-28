@@ -266,6 +266,45 @@ hiding the proximal UR5e links. Override the processing reserve with
 Every segment writes `final/visibility_gate.json`, including human-visible,
 robot-visible, composited, and mismatch frame indices for each side.
 
+For the frozen SAM3 production path, run:
+
+```bash
+python scripts/run_egoquest_sam3_recording.py \
+  --recording /path/to/egoquest/recording \
+  --workspace /path/to/runtime \
+  --run-name sam3_production_v1 \
+  --workers 1 --gpu-devices 0 \
+  --chunk-overlap-frames 12 \
+  --minimum-visible-landmarks 8 \
+  --entry-padding-frames 8 --exit-padding-frames 8 \
+  --no-rgb-visibility-fusion \
+  --skip-unrenderable \
+  --sam3-prompt-mode geometry --sam3-prompt-stride 5
+```
+
+UR5e bases are camera/body-relative by default. Each chunk warm-starts from
+the preceding arm and hand state, retains the nearest wrapped-angle IK branch,
+and corrects the hidden robot root when a transient singularity would otherwise
+move the visible wrist by more than 5 mm or 3 degrees. Rendering accepts these
+per-frame base transforms and uses the runner's explicitly assigned,
+preflighted Vulkan device.
+
+Generate a frame-aligned four-panel review for any contiguous window with:
+
+```bash
+python scripts/assemble_episode_window_four_panel.py \
+  --recording /path/to/egoquest/recording \
+  --run /path/to/runtime/runs/sam3_production_v1/EPISODE \
+  --candidates /path/to/runtime/candidates/sam3_production_v1/EPISODE \
+  --start-frame 0 --end-frame 900 \
+  --output /path/to/review.mp4
+```
+
+The panels are GT with projected HTS keypoints, stabilized SAM3 removal mask,
+raw SAPIEN robot render, and final retargeted output. Source frames outside an
+active hand interval remain present and are shown unchanged rather than being
+dropped from the diagnostic timeline.
+
 ### Production multi-episode batch
 
 Prepare an immutable manifest before launching the dataset-wide run:

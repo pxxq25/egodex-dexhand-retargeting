@@ -48,6 +48,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--gpu-devices", type=int, nargs="+", required=True)
     parser.add_argument("--chunk-overlap-frames", type=int, default=12)
+    parser.add_argument("--minimum-visible-landmarks", type=int, default=1)
+    parser.add_argument("--entry-padding-frames", type=int, default=8)
+    parser.add_argument("--exit-padding-frames", type=int, default=8)
+    parser.add_argument(
+        "--rgb-visibility-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "allow direct RGB detections to create processing intervals; disable "
+            "when other people's hands can appear in the scene"
+        ),
+    )
     parser.add_argument("--skip-unrenderable", action="store_true")
     parser.add_argument("--sam3-checkpoint", type=Path)
     parser.add_argument("--sam3-prompt-stride", type=int, default=5)
@@ -86,7 +98,12 @@ def adaptive_command(
         "--workers", str(args.workers),
         "--gpu-devices", *(str(value) for value in args.gpu_devices),
         "--chunk-overlap-frames", str(args.chunk_overlap_frames),
+        "--minimum-visible-landmarks", str(args.minimum_visible_landmarks),
+        "--entry-padding-frames", str(args.entry_padding_frames),
+        "--exit-padding-frames", str(args.exit_padding_frames),
     ]
+    if not args.rgb_visibility_fusion:
+        command.append("--disable-rgb-visibility-fusion")
     if phase is not None:
         command.extend(["--phase", phase])
     if args.skip_unrenderable:

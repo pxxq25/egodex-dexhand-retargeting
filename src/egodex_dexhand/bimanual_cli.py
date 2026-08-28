@@ -143,6 +143,12 @@ def _parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{side}-write-continuity-state", type=Path)
     parser.add_argument("--continuity-source-frame", type=int, default=-1)
     parser.add_argument("--continuity-margin-frames", type=int, default=12)
+    parser.add_argument(
+        "--camera-relative-base",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="move each UR5e base with the egocentric camera (default: enabled)",
+    )
     add_temporal_smoothing_arguments(parser)
     return parser.parse_args()
 
@@ -220,6 +226,8 @@ def _provenance(args: argparse.Namespace) -> dict[str, object]:
         "human_mask_strategy": "union_of_side_specific_sam2_arm_hand_masks",
         "temporal_smoothing": smoothing_config.to_dict(),
         "shadow_root_smoothing": "preserve_dummy_q_and_smooth_forearm_se3",
+        "camera_relative_base": bool(args.camera_relative_base),
+        "camera_relative_base_residual_correction": "hidden_root_above_5mm_or_3deg",
     }
 
 
@@ -435,16 +443,20 @@ def main() -> None:
                 ),
                 base_translation_world=(
                     None
-                    if continuity_states[side] is None
+                    if continuity_states[side] is None or args.camera_relative_base
                     else continuity_states[side].base_translation_world
                 ),
                 base_rotation_world=(
                     None
-                    if continuity_states[side] is None
+                    if continuity_states[side] is None or args.camera_relative_base
                     else continuity_states[side].base_rotation_world
                 ),
+                camera_relative_base=args.camera_relative_base,
             )
-            if continuity_states[side] is not None:
+            if (
+                continuity_states[side] is not None
+                and not args.camera_relative_base
+            ):
                 arm_result = replace(
                     arm_result,
                     qpos=smooth_wrapped_joint_boundary(
