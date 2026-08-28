@@ -18,6 +18,19 @@ SPEC.loader.exec_module(adaptive_recording)
 
 
 class AdaptiveVisibilityTests(unittest.TestCase):
+    def test_visual_resume_preserves_prior_skip(self) -> None:
+        with mock.patch.object(adaptive_recording.Path, "exists", return_value=True):
+            self.assertTrue(
+                adaptive_recording.resume_skipped_visual(
+                    "visual", True, Path("skip_reason.json")
+                )
+            )
+        self.assertFalse(
+            adaptive_recording.resume_skipped_visual(
+                "trajectory", True, Path("skip_reason.json")
+            )
+        )
+
     def test_short_interior_visibility_gap_is_bridged(self) -> None:
         visible = np.asarray([False, True, True, False, False, True, False])
 

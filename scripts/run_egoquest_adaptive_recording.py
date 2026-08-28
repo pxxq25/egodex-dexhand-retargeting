@@ -225,6 +225,14 @@ def video_is_readable(path: Path) -> bool:
     return result.returncode == 0
 
 
+def resume_skipped_visual(
+    phase: str, skip_unrenderable: bool, skip_reason: Path
+) -> bool:
+    """Keep a trajectory rejection skipped when later phases resume."""
+
+    return phase == "visual" and skip_unrenderable and skip_reason.exists()
+
+
 def renderer_environment(
     project: Path, workspace: Path, base: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -1183,6 +1191,12 @@ def main() -> None:
         completed_visual = output / "final/composite_full.mp4"
         if args.phase == "visual" and video_is_readable(completed_visual):
             print(f"RESUME COMPLETE {name}", flush=True)
+            continue
+        prior_skip = run_root / "skipped_unrenderable" / name / "skip_reason.json"
+        if resume_skipped_visual(
+            args.phase, args.skip_unrenderable, prior_skip
+        ):
+            print(f"RESUME SKIPPED {name}", flush=True)
             continue
         try:
             process_chunk(
