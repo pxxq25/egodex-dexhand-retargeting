@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 
 import cv2
@@ -10,6 +12,251 @@ import numpy as np
 
 DEFAULT_MASK_DILATION = 10
 DEFAULT_SEAM_FEATHER = 4
+
+
+@dataclass(frozen=True)
+class RobotAwareMaskSummary:
+    frame_count: int
+    human_pixels: int
+    opaque_robot_covered_human_pixels: int
+    residual_human_pixels: int
+    removal_pixels: int
+    residual_human_ratio_mean: float
+    residual_human_ratio_p95: float
+    residual_human_ratio_max: float
+    removal_frame_ratio_max: float
+    empty_removal_frames: int
+
+
+@dataclass(frozen=True)
+class InpaintChangeSummary:
+    evaluated_pixels: int
+    mean_absolute_change: float
+    low_change_fraction: float
+    frame_low_change_fraction_p95: float
+
+
+def build_robot_context_frames(
+    source_frame_dir: str | Path,
+    robot_rgb_dir: str | Path,
+    robot_alpha_dir: str | Path,
+    output_dir: str | Path,
+) -> Path:
+    """Hide covered human pixels from the inpainter's source context.
+
+    A residual-only mask is insufficient when the unmasked pixels underneath
+    the future robot still contain the original arm: a temporal inpainter can
+    copy that foreground straight back into the visible residual. Feeding it a
+    robot-precomposited context removes that leakage source. The final robot is
+    composited again after inpainting, so this is only context preparation and
+    does not change the renderer's ownership of final pixels.
+    """
+
+    source_paths = sorted(Path(source_frame_dir).glob("*.jpg"))
+    rgb_paths = _numbered_images(Path(robot_rgb_dir))
+    alpha_paths = _numbered_images(Path(robot_alpha_dir))
+    if not source_paths:
+        raise FileNotFoundError(f"no JPG frames in {source_frame_dir}")
+    if not (len(source_paths) == len(rgb_paths) == len(alpha_paths)):
+        raise ValueError("source, robot-RGB, and robot-alpha frame counts differ")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    if any(destination.iterdir()):
+        raise FileExistsError(f"refusing to overwrite non-empty {destination}")
+    for index, (source_path, rgb_path, alpha_path) in enumerate(
+        zip(source_paths, rgb_paths, alpha_paths)
+    ):
+        source = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+        robot = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+        alpha_raw = cv2.imread(str(alpha_path), cv2.IMREAD_UNCHANGED)
+        if source is None or robot is None or alpha_raw is None:
+            raise RuntimeError(f"could not decode robot-context input {index}")
+        if alpha_raw.ndim == 3:
+            alpha_raw = alpha_raw[..., 0]
+        if source.shape != robot.shape or source.shape[:2] != alpha_raw.shape:
+            raise ValueError(f"robot-context shape mismatch at frame {index}")
+        alpha_max = float(np.iinfo(alpha_raw.dtype).max) if np.issubdtype(
+            alpha_raw.dtype, np.integer
+        ) else 1.0
+        alpha = (
+            alpha_raw.astype(np.float32) / max(alpha_max, 1.0)
+        )[..., None]
+        context = np.rint(
+            robot.astype(np.float32) * alpha
+            + source.astype(np.float32) * (1.0 - alpha)
+        ).astype(np.uint8)
+        output = destination / f"{index:05d}.jpg"
+        if not cv2.imwrite(
+            str(output), context, [cv2.IMWRITE_JPEG_QUALITY, 98]
+        ):
+            raise RuntimeError(f"could not write {output}")
+    return destination
+
+
+def _numbered_images(path: Path) -> list[Path]:
+    values = sorted(path.glob("*.png"))
+    if not values:
+        raise FileNotFoundError(f"no PNG frames in {path}")
+    return values
+
+
+def build_robot_aware_removal_masks(
+    human_mask_dir: str | Path,
+    robot_alpha_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    opaque_threshold: float = 0.98,
+    seam_dilation_pixels: int | None = None,
+) -> RobotAwareMaskSummary:
+    """Remove only human pixels that the opaque robot will not cover.
+
+    Background under an opaque robot is unobservable and also irrelevant to
+    the final composite. Keeping it out of the inpaint mask turns a persistent
+    arm-sized hole into the usually narrow silhouette residual that is truly
+    visible. A small seam band covers antialiased robot edges.
+    """
+
+    human_paths = _numbered_images(Path(human_mask_dir))
+    alpha_paths = _numbered_images(Path(robot_alpha_dir))
+    if len(human_paths) != len(alpha_paths):
+        raise ValueError("human-mask and robot-alpha frame counts differ")
+    if not 0.0 < opaque_threshold <= 1.0:
+        raise ValueError("opaque_threshold must be in (0, 1]")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    if any(destination.iterdir()):
+        raise FileExistsError(f"refusing to overwrite non-empty {destination}")
+
+    human_counts = []
+    covered_counts = []
+    residual_counts = []
+    removal_counts = []
+    image_area = None
+    for index, (human_path, alpha_path) in enumerate(zip(human_paths, alpha_paths)):
+        human_raw = cv2.imread(str(human_path), cv2.IMREAD_GRAYSCALE)
+        alpha_raw = cv2.imread(str(alpha_path), cv2.IMREAD_UNCHANGED)
+        if human_raw is None or alpha_raw is None:
+            raise RuntimeError(f"could not decode robot-aware mask input {index}")
+        if alpha_raw.ndim == 3:
+            alpha_raw = alpha_raw[..., 0]
+        if human_raw.shape != alpha_raw.shape:
+            raise ValueError(f"mask shape mismatch at frame {index}")
+        if image_area is None:
+            image_area = int(human_raw.size)
+        alpha_max = float(np.iinfo(alpha_raw.dtype).max) if np.issubdtype(
+            alpha_raw.dtype, np.integer
+        ) else 1.0
+        alpha = alpha_raw.astype(np.float32) / max(alpha_max, 1.0)
+        human = human_raw > 0
+        opaque_robot = alpha >= opaque_threshold
+        residual = human & ~opaque_robot
+        seam = (
+            max(2, int(round(min(human.shape) * 0.00625)))
+            if seam_dilation_pixels is None
+            else int(seam_dilation_pixels)
+        )
+        if seam < 0:
+            raise ValueError("seam_dilation_pixels must be non-negative")
+        if seam:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * seam + 1, 2 * seam + 1)
+            )
+            removal = cv2.dilate(residual.astype(np.uint8), kernel) > 0
+            human_envelope = cv2.dilate(human.astype(np.uint8), kernel) > 0
+            removal &= human_envelope
+        else:
+            removal = residual
+        output = destination / f"{index:05d}.png"
+        if not cv2.imwrite(str(output), removal.astype(np.uint8) * 255):
+            raise RuntimeError(f"could not write {output}")
+        human_counts.append(int(np.count_nonzero(human)))
+        covered_counts.append(int(np.count_nonzero(human & opaque_robot)))
+        residual_counts.append(int(np.count_nonzero(residual)))
+        removal_counts.append(int(np.count_nonzero(removal)))
+
+    human_values = np.asarray(human_counts, dtype=np.float64)
+    residual_values = np.asarray(residual_counts, dtype=np.float64)
+    ratios = np.divide(
+        residual_values,
+        human_values,
+        out=np.zeros_like(residual_values),
+        where=human_values > 0,
+    )
+    assert image_area is not None
+    summary = RobotAwareMaskSummary(
+        frame_count=len(human_paths),
+        human_pixels=int(np.sum(human_values)),
+        opaque_robot_covered_human_pixels=int(np.sum(covered_counts)),
+        residual_human_pixels=int(np.sum(residual_values)),
+        removal_pixels=int(np.sum(removal_counts)),
+        residual_human_ratio_mean=float(np.mean(ratios)),
+        residual_human_ratio_p95=float(np.quantile(ratios, 0.95)),
+        residual_human_ratio_max=float(np.max(ratios)),
+        removal_frame_ratio_max=float(np.max(removal_counts) / image_area),
+        empty_removal_frames=int(np.count_nonzero(np.asarray(removal_counts) == 0)),
+    )
+    # ProPainter treats every file in its mask directory as an image. Keep
+    # provenance beside that directory so a JSON receipt cannot be decoded as
+    # a mask frame.
+    (destination.parent / f"{destination.name}_summary.json").write_text(
+        json.dumps(asdict(summary), indent=2) + "\n"
+    )
+    return summary
+
+
+def evaluate_inpaint_change(
+    frames_dir: str | Path,
+    masks_dir: str | Path,
+    inpainted_video: str | Path,
+    *,
+    low_change_threshold: float = 10.0,
+) -> InpaintChangeSummary:
+    """Detect a failed inpainter that copied the removed foreground back."""
+
+    frame_paths = sorted(Path(frames_dir).glob("*.jpg"))
+    mask_paths = _numbered_images(Path(masks_dir))
+    if len(frame_paths) != len(mask_paths):
+        raise ValueError("source-frame and removal-mask counts differ")
+    if low_change_threshold < 0:
+        raise ValueError("low_change_threshold must be non-negative")
+    reader = cv2.VideoCapture(str(inpainted_video))
+    if not reader.isOpened():
+        raise RuntimeError(f"could not open {inpainted_video}")
+    changes = []
+    low_change = 0
+    evaluated = 0
+    frame_fractions = []
+    for index, (frame_path, mask_path) in enumerate(zip(frame_paths, mask_paths)):
+        source = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        ok, result = reader.read()
+        if source is None or mask is None or not ok:
+            raise RuntimeError(f"could not decode inpaint-change frame {index}")
+        if source.shape != result.shape or mask.shape != source.shape[:2]:
+            raise ValueError(f"inpaint-change shape mismatch at frame {index}")
+        selected = mask > 0
+        count = int(np.count_nonzero(selected))
+        if count == 0:
+            frame_fractions.append(0.0)
+            continue
+        difference = np.mean(
+            np.abs(source.astype(np.float32) - result.astype(np.float32)), axis=2
+        )[selected]
+        changes.append(difference)
+        low = int(np.count_nonzero(difference < low_change_threshold))
+        low_change += low
+        evaluated += count
+        frame_fractions.append(low / count)
+    reader.release()
+    if evaluated == 0:
+        return InpaintChangeSummary(0, 0.0, 0.0, 0.0)
+    all_changes = np.concatenate(changes)
+    return InpaintChangeSummary(
+        evaluated_pixels=evaluated,
+        mean_absolute_change=float(np.mean(all_changes)),
+        low_change_fraction=float(low_change / evaluated),
+        frame_low_change_fraction_p95=float(np.quantile(frame_fractions, 0.95)),
+    )
 
 
 def propainter_environment() -> dict[str, str]:
