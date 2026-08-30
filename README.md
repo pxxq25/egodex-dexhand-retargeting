@@ -237,6 +237,49 @@ For difficult lighting or projection mismatch, the repository also includes:
 Pass the image-aligned result to `egodex-bimanual-shadow --mask-hdf5 ...` so
 masking can be corrected without changing robot motion.
 
+### Screen-registered replacement and residual inpaint
+
+The physical UR5e trajectory is useful for kinematics, but a wrist-only root
+fit does not prove that the rendered palm and fingers land on the observed
+hand. For a visual replacement that is explicitly checked in image space, run:
+
+```bash
+python scripts/run_screen_registered_retarget.py \
+  --segment /path/to/run/segments/001_right_00241_00447 \
+  --candidate /path/to/candidate \
+  --side right \
+  --propainter-root "$EGODEX_DEXHAND_ROOT/third_party/ProPainter" \
+  --render-device cuda:0 \
+  --output /path/to/screen_registered_review
+```
+
+This path uses no scene-specific geometry or hand-tuned forearm thickness:
+
+1. A reflection-free similarity transform fits all 21 Shadow landmarks while
+   keeping the tracked wrist exact and one scale fixed for the whole clip.
+2. The human-mask component touching the wrist is first completed with a
+   bounded, wrist-seeded appearance model. This repairs one-sided sleeve-mask
+   misses without skin colours or scene labels. Its axis, length, and width
+   size the mechanical forearm, which is attached to the fitted wrist
+   independently of hidden UR5e links.
+3. Human pixels covered by an opaque robot are not inpainted because they can
+   never appear in the final composite. Before ProPainter runs, those hidden
+   source pixels are replaced by the robot as context, preventing the model
+   from copying the covered arm back into the visible residual. ProPainter
+   receives only that residual plus a resolution-scaled seam band.
+4. `quality_gate.json` fails on reflection, hand reprojection error, the
+   transformed forearm axis pointing away from the observed sleeve, implausible
+   robot area, excessive uncovered human area, or an inpainter that copied the
+   removed foreground back. A second image-space direction check runs only
+   when enough of the forearm centreline is inside the frame; a cropped cuff at
+   the image boundary is recorded as unobservable instead of being mistaken
+   for a rotated forearm.
+
+`human_review_four_panel.mp4` is the reviewer-facing artifact: source, exact
+pixels requested for removal, registered robot on a neutral background, and
+the final composite. A technical pass is necessary but does not replace this
+continuous visual review.
+
 ### Adaptive whole-recording processing
 
 Use the adaptive runner when a recording alternates between left-hand,
@@ -382,6 +425,10 @@ python scripts/verify_environment.py \
 - Heavy hand/object occlusion can still require corrected image-space prompts.
 - ProPainter may leave ghosts when removal masks miss the first or last visible
   frames; the pipeline therefore expands and temporally smooths tracked masks.
+- Screen-registered residual inpainting deliberately fails when too much of the
+  human remains outside the robot. If a large background region was never
+  visible anywhere in the video, exact recovery is impossible and requires an
+  explicitly configured generative video-inpainting backend.
 - Robot arm base placement is fitted to the observed trajectory and may need a
   side-specific reference posture for unusual camera motion.
 
